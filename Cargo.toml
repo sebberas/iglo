@@ -3,11 +3,13 @@ name = "iglo"
 version = "0.1.0"
 edition = "2021"
 
+[build-dependencies]
+cmake = "0.1.49"
+
 [dependencies]
-futures = "0.3.24"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.42.0", features = [
+windows = { version = "0.43.0", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",

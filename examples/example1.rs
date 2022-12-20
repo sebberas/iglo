@@ -1,13 +1,14 @@
-#![feature(async_closure)]
-use iglo::core::*;
 use iglo::os::*;
+use iglo::rhi::*;
 
 fn main() {
-    let f = async {
-        let mut window = Window::new("iglo").unwrap();
-        window.show();
-    };
+    let mut window = Window::new("iglo").unwrap();
+    let instance = Instance::new(Backend::D3D12, true).unwrap();
+    let device = instance.new_device().unwrap();
 
-    let mut executor = Executor::new();
-    executor.run(f);
+    window.show();
+
+    loop {
+        window.poll_events()
+    }
 }

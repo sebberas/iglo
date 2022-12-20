@@ -2,8 +2,6 @@ use std::future::*;
 use std::pin::*;
 use std::task::*;
 
-use futures::prelude::*;
-
 pub struct Executor {}
 
 impl Executor {

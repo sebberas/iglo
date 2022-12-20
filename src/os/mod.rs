@@ -13,6 +13,9 @@ trait WindowApi: Sized {
 
     fn show(&mut self);
     fn hide(&mut self);
+
+    fn poll_events(&self) -> ();
+    fn wait_events(&self) -> ();
 }
 
 #[derive(Debug)]
@@ -36,5 +39,15 @@ impl Window {
     #[inline]
     pub fn hide(&mut self) {
         self.0.hide()
+    }
+
+    #[inline]
+    pub fn poll_events(&self) {
+        self.0.poll_events()
+    }
+
+    #[inline]
+    pub fn wait_events(&self) {
+        self.0.wait_events()
     }
 }

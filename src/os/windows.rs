@@ -33,7 +33,7 @@ impl os::WindowApi for Window {
         let hinstance = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap();
 
         // SAFETY:
-        const WINDOW_CLASS_NAME: &HSTRING = w!("iglo_window");
+        const WINDOW_CLASS_NAME: PCWSTR = w!("iglo_window");
         if unsafe { !IS_WINDOW_REGISTERED } {
             let window_class = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -47,7 +47,7 @@ impl os::WindowApi for Window {
                 hbrBackground: HBRUSH::default(),
                 hIconSm: HICON::default(),
                 lpszMenuName: PCWSTR::null(),
-                lpszClassName: WINDOW_CLASS_NAME.into(),
+                lpszClassName: WINDOW_CLASS_NAME,
             };
 
             // SAFETY:
@@ -67,7 +67,7 @@ impl os::WindowApi for Window {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 WINDOW_CLASS_NAME,
-                &HSTRING::from(title).into(),
+                &HSTRING::from(title),
                 WS_OVERLAPPEDWINDOW,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
@@ -91,5 +91,29 @@ impl os::WindowApi for Window {
     fn hide(&mut self) {
         // SAFETY:
         unsafe { ShowWindow(self.0.hwnd, SW_HIDE) };
+    }
+
+    fn poll_events(&self) -> () {
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, self.0.hwnd, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        ()
+    }
+
+    fn wait_events(&self) -> () {
+        let mut msg = MSG::default();
+        while unsafe { GetMessageW(&mut msg, self.0.hwnd, 0, 0) }.as_bool() {
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        ()
     }
 }
