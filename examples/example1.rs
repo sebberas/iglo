@@ -3,8 +3,10 @@ use iglo::rhi::*;
 
 fn main() {
     let mut window = Window::new("iglo").unwrap();
-    let instance = Instance::new(Backend::D3D12, true).unwrap();
-    let device = instance.new_device().unwrap();
+    let instance = Instance::new(Backend::DX12, true).unwrap();
+    let surface = unsafe { instance.new_surface(&window) }.unwrap();
+    let device = instance.new_device(Some(&surface)).unwrap();
+    let swapchain = instance.new_swapchain(&device, surface).unwrap();
 
     window.show();
 

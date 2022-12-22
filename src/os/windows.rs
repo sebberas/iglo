@@ -117,3 +117,20 @@ impl os::WindowApi for Window {
         ()
     }
 }
+
+pub trait WindowExt {
+    fn hwnd(&self) -> HWND;
+    fn hinstance(&self) -> HINSTANCE;
+}
+
+impl WindowExt for os::Window {
+    fn hwnd(&self) -> HWND {
+        let platform = &self.0;
+        platform.0.hwnd
+    }
+
+    fn hinstance(&self) -> HINSTANCE {
+        let platform = &self.0;
+        platform.0.hinstance
+    }
+}
