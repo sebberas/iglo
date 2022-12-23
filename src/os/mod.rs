@@ -26,9 +26,7 @@ pub struct Window(imp::Window);
 impl Window {
     #[inline]
     pub fn new(title: &str) -> Result<Self, WindowError> {
-        imp::Window::new(title)
-            .map(|v| Self(v))
-            .map_err(|e| WindowError(e))
+        imp::Window::new(title).map(Self).map_err(WindowError)
     }
 
     #[inline]
