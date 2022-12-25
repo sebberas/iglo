@@ -4,6 +4,7 @@
 #![feature(pin_macro)]
 #![feature(async_closure)]
 #![feature(trivial_bounds)]
+#![feature(nonzero_min_max)]
 
 pub mod core;
 pub mod os;
