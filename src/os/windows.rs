@@ -12,18 +12,58 @@ use crate::os;
 #[derive(Debug)]
 pub struct WindowError;
 
-struct WindowShared {
+struct WindowData {
     hwnd: HWND,
     hinstance: HINSTANCE,
+    should_close: bool,
 }
 
-pub struct Window(Box<WindowShared>);
+impl WindowData {
+    fn wndproc(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        match msg {
+            WM_CLOSE => {
+                self.should_close = true;
+                println!("WNDPROC: {:?}", self.should_close);
+                return LRESULT(0);
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+        }
+    }
 
-impl Window {
     extern "system" fn wndproc_setup(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        match msg {
+            WM_NCCREATE => {
+                // SAFETY:
+                // The Win32 API states that when the msg is WM_NCCREATE, lp is a pointer to a
+                // non-null CREATESTRUCTW struct.
+                let CREATESTRUCTW { lpCreateParams, .. } =
+                    unsafe { std::mem::transmute::<_, &CREATESTRUCTW>(lp) };
+
+                // SAFETY:
+                // - We know data is non-null because we supply it when calling CreateWindowExW.
+                // - The object is destroyed when the window is dropped because of Box's
+                //   semantics.
+                let data: &mut Self = unsafe { std::mem::transmute((*lpCreateParams)) };
+
+                // SAFETY
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as *const _ as isize) };
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, Self::wndproc_proxy as isize) };
+
+                data.wndproc(hwnd, msg, wp, lp)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+        }
+    }
+
+    extern "system" fn wndproc_proxy(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        let data: &mut Self =
+            unsafe { std::mem::transmute(GetWindowLongPtrW(hwnd, GWLP_USERDATA)) };
+
+        data.wndproc(hwnd, msg, wp, lp)
     }
 }
+
+pub struct Window(Box<WindowData>);
 
 static mut IS_WINDOW_REGISTERED: bool = false;
 
@@ -38,7 +78,7 @@ impl os::WindowApi for Window {
             let window_class = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: WNDCLASS_STYLES(0),
-                lpfnWndProc: Some(Self::wndproc_setup),
+                lpfnWndProc: Some(WindowData::wndproc_setup),
                 cbClsExtra: 0,
                 cbWndExtra: 0,
                 hInstance: hinstance,
@@ -57,13 +97,14 @@ impl os::WindowApi for Window {
             unsafe { IS_WINDOW_REGISTERED = true };
         }
 
-        let mut window_shared = Box::new(WindowShared {
+        let mut window_data = Box::new(WindowData {
             hwnd: HWND::default(),
             hinstance,
+            should_close: false,
         });
 
         // SAFETY:
-        window_shared.hwnd = unsafe {
+        window_data.hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 WINDOW_CLASS_NAME,
@@ -76,11 +117,11 @@ impl os::WindowApi for Window {
                 HWND::default(),
                 HMENU::default(),
                 hinstance,
-                Some(&*window_shared as *const WindowShared as *const _),
+                Some(window_data.as_mut() as *mut _ as *mut c_void),
             )
         };
 
-        Ok(Self(window_shared))
+        Ok(Self(window_data))
     }
 
     fn show(&mut self) {
@@ -95,26 +136,21 @@ impl os::WindowApi for Window {
 
     fn poll_events(&self) -> () {
         let mut msg = MSG::default();
-        while unsafe { PeekMessageW(&mut msg, self.0.hwnd, 0, 0, PM_REMOVE) }.as_bool() {
+        while unsafe { PeekMessageW(&mut msg, self.0.hwnd, 0, 0, PM_REMOVE) }.0 != 0 {
             unsafe {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
-
-        ()
     }
 
     fn wait_events(&self) -> () {
-        let mut msg = MSG::default();
-        while unsafe { GetMessageW(&mut msg, self.0.hwnd, 0, 0) }.as_bool() {
-            unsafe {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        unsafe { WaitMessage() };
+        self.poll_events()
+    }
 
-        ()
+    fn should_close(&self) -> bool {
+        self.0.should_close
     }
 }
 

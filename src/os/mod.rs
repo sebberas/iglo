@@ -16,6 +16,8 @@ trait WindowApi: Sized {
 
     fn poll_events(&self) -> ();
     fn wait_events(&self) -> ();
+
+    fn should_close(&self) -> bool;
 }
 
 #[derive(Debug)]
@@ -40,12 +42,16 @@ impl Window {
     }
 
     #[inline]
-    pub fn poll_events(&self) {
-        self.0.poll_events()
+    pub fn poll_events(&self) -> () {
+        self.0.poll_events();
     }
 
     #[inline]
-    pub fn wait_events(&self) {
-        self.0.wait_events()
+    pub fn wait_events(&self) -> () {
+        self.0.wait_events();
+    }
+
+    pub fn should_close(&self) -> bool {
+        self.0.should_close()
     }
 }
