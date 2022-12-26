@@ -28,8 +28,9 @@
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
-pub use self::format::{Format, FormatType};
-pub use self::usage::{BufferUsage, BufferUsageType, ImageUsage, ImageUsageType};
+use self::format::{Format, FormatType};
+use self::queue::{QueueKind, QueueType};
+use self::usage::{BufferUsage, BufferUsageType, ImageUsage, ImageUsageType};
 use crate::os::Window;
 
 pub mod dx12;
@@ -67,11 +68,11 @@ impl Instance {
         }
     }
 
-    pub fn new_device(&self, surface: Option<&Surface>) -> Result<Device> {
+    pub fn new_device(&self, props: &DeviceProps) -> Result<Device> {
         match self {
             Self::DX12(i) => {
-                let surface = surface.map(TryInto::try_into).transpose();
-                i.new_device(surface?).map(Device::DX12)
+                let surface = props.surface.map(TryInto::try_into).transpose();
+                i.new_device(surface?, props).map(Device::DX12)
             }
         }
     }
@@ -90,8 +91,12 @@ pub enum Surface {
     DX12(dx12::Surface),
 }
 
-pub struct DeviceInfo<'a> {
+#[derive(Default, Clone, Copy)]
+pub struct DeviceProps<'a> {
     pub surface: Option<&'a Surface>,
+    pub max_graphics_queues: Option<NonZeroUsize>,
+    pub max_compute_queues: Option<NonZeroUsize>,
+    pub max_transfer_queues: Option<NonZeroUsize>,
 }
 
 pub enum Device {
@@ -99,14 +104,51 @@ pub enum Device {
 }
 
 impl Device {
-    /// Creates a new queue that can be used for execution on the GPU.
-    pub fn new_command_queue(&self) -> Result<CommandQueue> {
+    /// Creates a new queue that can be used for asynchronous execution on the
+    /// GPU.
+    ///
+    /// Three different kinds of queues are available:
+    ///
+    /// **Graphics** - Which is able to execute all commands, graphics specific
+    /// commands included.
+    ///
+    /// **Compute** - Which is able to execute compute
+    /// and transfer commands.
+    ///
+    /// **Transfer** - Which is able to execute
+    /// transfer commands.
+    ///
+    /// It is recommended to use a queue with the least amount of supported
+    /// commands for your use case since the driver is able to optimize it
+    /// better by parallelizing execution of different queue types. For
+    /// a more in-depth explanation of these concepts see ...
+    ///
+    /// # Arguments
+    ///
+    /// - `kind` - The kind of queue to create.
+    ///
+    /// # Returns
+    ///
+    /// Queues are not an infinite resource, so the device is allowed to return
+    /// `None`, if no more queues of that type are available, but the call was
+    /// otherwise successfull.
+    pub fn new_command_queue<K>(&self, kind: K) -> Result<Option<CommandQueue<K>>>
+    where
+        K: QueueKind,
+    {
         match self {
-            Self::DX12(d) => d.new_command_queue().map(CommandQueue::DX12),
+            Self::DX12(d) => d.new_command_queue(kind).map(|q| q.map(CommandQueue::DX12)),
         }
     }
 
-    pub fn new_command_pool(&self) -> Result<CommandPool> {
+    /// Creates a new command pool linked with a supplied command queue.
+    ///
+    /// The command pool represents an allocator that backs command lists
+    /// created from that pool.
+    pub fn new_command_pool<K>(&self) -> Result<CommandPool>
+    where
+        K: QueueKind,
+    {
         match self {
             Self::DX12(d) => d.new_command_pool().map(CommandPool::DX12),
         }
@@ -189,8 +231,36 @@ impl Swapchain {
     }
 }
 
-pub enum CommandQueue {
-    DX12(dx12::CommandQueue),
+// TODO: Rename to commands (?).
+pub mod queue {
+    pub enum QueueType {
+        Graphics,
+        Compute,
+        Transfer,
+    }
+
+    pub trait QueueKind {
+        const QUEUE_TYPE: QueueType;
+    }
+
+    pub struct Graphics;
+    impl QueueKind for Graphics {
+        const QUEUE_TYPE: QueueType = QueueType::Graphics;
+    }
+
+    pub struct Compute;
+    impl QueueKind for Compute {
+        const QUEUE_TYPE: QueueType = QueueType::Compute;
+    }
+
+    pub struct Transfer;
+    impl QueueKind for Transfer {
+        const QUEUE_TYPE: QueueType = QueueType::Graphics;
+    }
+}
+
+pub enum CommandQueue<K: QueueKind> {
+    DX12(dx12::CommandQueue<K>),
 }
 
 pub enum CommandPool {
