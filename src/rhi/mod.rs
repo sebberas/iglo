@@ -130,8 +130,8 @@ impl Device {
     /// # Returns
     ///
     /// Queues are not an infinite resource, so the device is allowed to return
-    /// `None`, if no more queues of that type are available, but the call was
-    /// otherwise successfull.
+    /// `None`, if no more queues of the requested type are available, but the
+    /// call was otherwise successfull.
     pub fn new_command_queue<K>(&self, kind: K) -> Result<Option<CommandQueue<K>>>
     where
         K: QueueKind,
@@ -145,16 +145,22 @@ impl Device {
     ///
     /// The command pool represents an allocator that backs command lists
     /// created from that pool.
-    pub fn new_command_pool<K>(&self) -> Result<CommandPool>
+    pub fn new_command_pool<K>(&self, queue: &CommandQueue<K>) -> Result<CommandPool<K>>
     where
         K: QueueKind,
     {
         match self {
-            Self::DX12(d) => d.new_command_pool().map(CommandPool::DX12),
+            Self::DX12(d) => {
+                let queue = queue.try_into()?;
+                d.new_command_pool(queue).map(CommandPool::DX12)
+            }
         }
     }
 
-    pub fn new_command_list(&self, pool: &mut CommandPool) -> Result<CommandList> {
+    pub fn new_command_list<K>(&self, pool: &mut CommandPool<K>) -> Result<CommandList>
+    where
+        K: QueueKind,
+    {
         match self {
             Self::DX12(d) => {
                 let pool = pool.try_into()?;
@@ -195,6 +201,8 @@ impl Device {
     /// - Panics if `ImageProps::width` or `ImageProps::height` are
     /// larger than the size allowed by the API. These constraints should be
     /// queried at runtime.
+    ///
+    /// - Panics if the image is being created with an unknown format.
     ///
     /// # Returns
     ///
@@ -263,8 +271,8 @@ pub enum CommandQueue<K: QueueKind> {
     DX12(dx12::CommandQueue<K>),
 }
 
-pub enum CommandPool {
-    DX12(dx12::CommandPool),
+pub enum CommandPool<K: QueueKind> {
+    DX12(dx12::CommandPool<K>),
 }
 
 pub enum CommandList {
@@ -519,9 +527,13 @@ pub mod format {
             R16Sint,
             R16Float,
 
+            D16Unorm,
+
             R32Uint,
             R32Sint,
             R32Float,
+
+            D32Float,
 
             R8G8Unorm,
             R8G8Snorm,
@@ -533,6 +545,8 @@ pub mod format {
             R16G16Uint,
             R16G16Sint,
             R16G16Float,
+
+            D24UnormS8Uint,
 
             R32G32Uint,
             R32G32Sint,

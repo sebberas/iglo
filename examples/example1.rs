@@ -19,12 +19,15 @@ fn main() {
     let mut props = ImageProps::builder()
         .width(NonZeroUsize::new(256).unwrap())
         .height(NonZeroUsize::new(256).unwrap())
-        .format(format::R8G8B8A8Unorm)
+        .format(format::D16Unorm)
         .usage(usage::DepthStencil);
 
     let depth = device.new_image(&mut props).unwrap();
 
     let graphics_queue = device.new_command_queue(queue::Graphics).unwrap().unwrap();
+    let pool = device.new_command_pool(&graphics_queue).unwrap();
+
+    swapchain.present().unwrap();
 
     window.show();
     while !window.should_close() {

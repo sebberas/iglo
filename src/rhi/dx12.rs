@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-use super::queue::QueueKind;
+use super::queue::{QueueKind, QueueType};
 use super::{DeviceProps, ImageProps};
 use crate::os::windows::WindowExt;
 use crate::os::Window;
@@ -232,14 +232,18 @@ struct DeviceShared {
 pub struct Device(Arc<DeviceShared>);
 
 impl Device {
-    pub fn new_command_queue<K>(&self, kind: K) -> Result<Option<CommandQueue<K>>>
+    pub fn new_command_queue<K>(&self, _kind: K) -> Result<Option<CommandQueue<K>>>
     where
         K: QueueKind,
     {
         let DeviceShared { device, .. } = &*self.0;
 
         let desc = D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            Type: match K::QUEUE_TYPE {
+                QueueType::Graphics => D3D12_COMMAND_LIST_TYPE_DIRECT,
+                QueueType::Compute => D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                QueueType::Transfer => D3D12_COMMAND_LIST_TYPE_COPY,
+            },
             Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
             ..Default::default()
         };
@@ -252,7 +256,10 @@ impl Device {
         }))
     }
 
-    pub fn new_command_pool(&self) -> Result<CommandPool> {
+    pub fn new_command_pool<K>(&self, queue: &CommandQueue<K>) -> Result<CommandPool<K>>
+    where
+        K: QueueKind,
+    {
         let DeviceShared { device, .. } = &*self.0;
 
         let allocator =
@@ -261,10 +268,14 @@ impl Device {
         Ok(CommandPool {
             allocator,
             _device: Arc::clone(&self.0),
+            _marker: PhantomData,
         })
     }
 
-    pub fn new_command_list(&self, _pool: &mut CommandPool) -> Result<CommandList> {
+    pub fn new_command_list<K>(&self, _pool: &mut CommandPool<K>) -> Result<CommandList>
+    where
+        K: QueueKind,
+    {
         let DeviceShared { device, .. } = &*self.0;
 
         let kind = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -358,7 +369,12 @@ impl Device {
                     Quality: 0,
                 },
                 Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-                Flags: D3D12_RESOURCE_FLAG_NONE,
+                Flags: match U::USAGE_TYPE {
+                    ImageUsageType::Unknown => {
+                        panic!("Images cannot be created with an unknown format")
+                    }
+                    ImageUsageType::DepthStencil => D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                },
             };
 
             unsafe {
@@ -443,15 +459,27 @@ pub struct CommandQueue<K: QueueKind> {
     _marker: PhantomData<K>,
 }
 
-pub struct CommandPool {
-    allocator: ID3D12CommandAllocator,
-    _device: Arc<DeviceShared>,
-}
-
-impl<'a> TryFrom<&'a rhi::CommandPool> for &'a CommandPool {
+impl<'a, K: QueueKind> TryFrom<&'a rhi::CommandQueue<K>> for &'a CommandQueue<K> {
     type Error = Error;
 
-    fn try_from(value: &'a rhi::CommandPool) -> Result<Self> {
+    fn try_from(value: &'a rhi::CommandQueue<K>) -> Result<Self> {
+        match value {
+            rhi::CommandQueue::DX12(q) => Ok(q),
+            _ => Err(Error::BackendMismatch),
+        }
+    }
+}
+
+pub struct CommandPool<K: QueueKind> {
+    allocator: ID3D12CommandAllocator,
+    _device: Arc<DeviceShared>,
+    _marker: PhantomData<K>,
+}
+
+impl<'a, K: QueueKind> TryFrom<&'a rhi::CommandPool<K>> for &'a CommandPool<K> {
+    type Error = Error;
+
+    fn try_from(value: &'a rhi::CommandPool<K>) -> Result<Self> {
         match value {
             rhi::CommandPool::DX12(p) => Ok(p),
             _ => Err(Error::BackendMismatch),
@@ -459,10 +487,10 @@ impl<'a> TryFrom<&'a rhi::CommandPool> for &'a CommandPool {
     }
 }
 
-impl<'a> TryFrom<&'a mut rhi::CommandPool> for &'a mut CommandPool {
+impl<'a, K: QueueKind> TryFrom<&'a mut rhi::CommandPool<K>> for &'a mut CommandPool<K> {
     type Error = Error;
 
-    fn try_from(value: &'a mut rhi::CommandPool) -> Result<Self> {
+    fn try_from(value: &'a mut rhi::CommandPool<K>) -> Result<Self> {
         match value {
             rhi::CommandPool::DX12(p) => Ok(p),
             _ => Err(Error::BackendMismatch),
@@ -507,9 +535,13 @@ impl From<FormatType> for DXGI_FORMAT {
             R16Sint => DXGI_FORMAT_R16_SINT,
             R16Float => DXGI_FORMAT_R16_FLOAT,
 
+            D16Unorm => DXGI_FORMAT_D16_UNORM,
+
             R32Uint => DXGI_FORMAT_R32_UINT,
             R32Sint => DXGI_FORMAT_R32_SINT,
             R32Float => DXGI_FORMAT_R32_FLOAT,
+
+            D32Float => DXGI_FORMAT_D32_FLOAT,
 
             R8G8Unorm => DXGI_FORMAT_R8G8_UNORM,
             R8G8Snorm => DXGI_FORMAT_R8G8_SNORM,
@@ -521,6 +553,8 @@ impl From<FormatType> for DXGI_FORMAT {
             R16G16Uint => DXGI_FORMAT_R16G16_UINT,
             R16G16Sint => DXGI_FORMAT_R16G16_SINT,
             R16G16Float => DXGI_FORMAT_R16G16_FLOAT,
+
+            D24UnormS8Uint => DXGI_FORMAT_D24_UNORM_S8_UINT,
 
             R32G32Uint => DXGI_FORMAT_R32G32_UINT,
             R32G32Sint => DXGI_FORMAT_R32G32_SINT,
