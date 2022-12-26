@@ -11,7 +11,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
-use super::ImageProps;
+use super::queue::QueueKind;
+use super::{DeviceProps, ImageProps};
 use crate::os::windows::WindowExt;
 use crate::os::Window;
 use crate::rhi::{
@@ -81,7 +82,7 @@ impl Instance {
         })
     }
 
-    pub fn new_device(&self, surface: Option<&Surface>) -> Result<Device> {
+    pub fn new_device(&self, surface: Option<&Surface>, props: &DeviceProps) -> Result<Device> {
         let InstanceShared { debugger, .. } = &*self.0;
 
         if debugger.is_some() {
@@ -231,7 +232,10 @@ struct DeviceShared {
 pub struct Device(Arc<DeviceShared>);
 
 impl Device {
-    pub fn new_command_queue(&self) -> Result<CommandQueue> {
+    pub fn new_command_queue<K>(&self, kind: K) -> Result<Option<CommandQueue<K>>>
+    where
+        K: QueueKind,
+    {
         let DeviceShared { device, .. } = &*self.0;
 
         let desc = D3D12_COMMAND_QUEUE_DESC {
@@ -241,10 +245,11 @@ impl Device {
         };
 
         let queue = unsafe { device.CreateCommandQueue(&desc) }.unwrap();
-        Ok(CommandQueue {
+        Ok(Some(CommandQueue {
             queue,
             _device: Arc::clone(&self.0),
-        })
+            _marker: PhantomData,
+        }))
     }
 
     pub fn new_command_pool(&self) -> Result<CommandPool> {
@@ -432,9 +437,10 @@ impl Swapchain {
 
 pub struct RenderTarget {}
 
-pub struct CommandQueue {
+pub struct CommandQueue<K: QueueKind> {
     queue: ID3D12CommandQueue,
     _device: Arc<DeviceShared>,
+    _marker: PhantomData<K>,
 }
 
 pub struct CommandPool {
