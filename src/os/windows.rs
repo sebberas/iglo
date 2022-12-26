@@ -43,13 +43,14 @@ impl WindowData {
                 // - We know data is non-null because we supply it when calling CreateWindowExW.
                 // - The object is destroyed when the window is dropped because of Box's
                 //   semantics.
-                let data: &mut Self = unsafe { std::mem::transmute((*lpCreateParams)) };
+                let data: *mut Self = unsafe { std::mem::transmute(*lpCreateParams) };
 
                 // SAFETY
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as *const _ as isize) };
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, Self::wndproc_proxy as isize) };
 
-                data.wndproc(hwnd, msg, wp, lp)
+                // SAFETY
+                unsafe { &mut (*data) }.wndproc(hwnd, msg, wp, lp)
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
         }
