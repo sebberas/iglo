@@ -29,8 +29,9 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
 use self::format::{Format, FormatType};
-use self::queue::{QueueKind, QueueType};
-use self::usage::{BufferUsage, BufferUsageType, ImageUsage, ImageUsageType};
+use self::queue::QueueKind;
+use self::state::{Initial, State};
+use self::usage::{BufferUsage, ImageUsage};
 use crate::os::Window;
 
 pub mod dx12;
@@ -119,7 +120,7 @@ impl Device {
     /// transfer commands.
     ///
     /// It is recommended to use a queue with the least amount of supported
-    /// commands for your use case since the driver is able to optimize it
+    /// commands since the driver is able to optimize it
     /// better by parallelizing execution of different queue types. For
     /// a more in-depth explanation of these concepts see ...
     ///
@@ -143,8 +144,8 @@ impl Device {
 
     /// Creates a new command pool linked with a supplied command queue.
     ///
-    /// The command pool represents an allocator that backs command lists
-    /// created from that pool.
+    /// The command pool is an allocator that manages all the memory used by
+    /// different command lists.
     pub fn new_command_pool<K>(&self, queue: &CommandQueue<K>) -> Result<CommandPool<K>>
     where
         K: QueueKind,
@@ -157,7 +158,16 @@ impl Device {
         }
     }
 
-    pub fn new_command_list<K>(&self, pool: &mut CommandPool<K>) -> Result<CommandList>
+    /// Creates a new command list.
+    ///
+    /// A command list is created in the initial state. The same command pool
+    /// used when creating the command list, must be used for all further
+    /// operations where a pool is needed.
+    ///
+    /// # Arguments
+    ///
+    /// - `pool` - The pool that should be backing this command list.
+    pub fn new_command_list<K>(&self, pool: &mut CommandPool<K>) -> Result<CommandList<K, Initial>>
     where
         K: QueueKind,
     {
@@ -275,8 +285,21 @@ pub enum CommandPool<K: QueueKind> {
     DX12(dx12::CommandPool<K>),
 }
 
-pub enum CommandList {
-    DX12(dx12::CommandList),
+pub mod state {
+    pub trait State {}
+
+    pub struct Initial;
+    impl State for Initial {}
+
+    pub struct Recording;
+    impl State for Recording {}
+
+    pub struct Executeable;
+    impl State for Executeable {}
+}
+
+pub enum CommandList<K: QueueKind, S: State> {
+    DX12(dx12::CommandList<K, S>),
 }
 
 pub struct BufferProps<T: BufferLayout, U: BufferUsage> {

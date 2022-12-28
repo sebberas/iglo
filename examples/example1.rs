@@ -24,12 +24,13 @@ fn main() {
 
     let depth = device.new_image(&mut props).unwrap();
 
-    let graphics_queue = device.new_command_queue(queue::Graphics).unwrap().unwrap();
-    let pool = device.new_command_pool(&graphics_queue).unwrap();
-
-    swapchain.present().unwrap();
+    let queue = device.new_command_queue(queue::Graphics).unwrap().unwrap();
+    let mut pool = device.new_command_pool(&queue).unwrap();
+    let list = device.new_command_list(&mut pool).unwrap();
 
     window.show();
+    swapchain.present().unwrap();
+
     while !window.should_close() {
         window.poll_events();
     }
