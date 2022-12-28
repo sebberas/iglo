@@ -1,15 +1,17 @@
+use std::alloc::*;
 use std::ffi::*;
 use std::marker::*;
 use std::sync::*;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use windows::core::{Interface, PCSTR};
-use windows::w;
+use windows::core::{Interface, GUID, PCSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::{s, w};
 
 use super::queue::{QueueKind, QueueType};
 use super::{DeviceProps, ImageProps};
@@ -21,9 +23,12 @@ use crate::rhi::{
 };
 
 struct InstanceDebugger {
-    dxgi: (IDXGIDebug, IDXGIInfoQueue),
+    dxgi: (IDXGIDebug, Arc<IDXGIInfoQueueSync>),
     thread: Option<JoinHandle<()>>,
 }
+
+unsafe impl Send for InstanceDebugger {}
+unsafe impl Sync for InstanceDebugger {}
 
 impl Drop for InstanceDebugger {
     fn drop(&mut self) {
@@ -38,6 +43,11 @@ struct InstanceShared {
     debugger: Option<InstanceDebugger>,
 }
 
+struct IDXGIInfoQueueSync(IDXGIInfoQueue);
+
+unsafe impl Send for IDXGIInfoQueueSync {}
+unsafe impl Sync for IDXGIInfoQueueSync {}
+
 pub struct Instance(Arc<InstanceShared>);
 
 unsafe impl Send for Instance {}
@@ -48,9 +58,75 @@ impl Instance {
 
     pub fn new(debug: bool) -> Result<Self> {
         let debugger = if debug {
+            const PRODUCER: GUID = DXGI_DEBUG_ALL;
             let controller: IDXGIDebug = unsafe { DXGIGetDebugInterface1(0) }.unwrap();
-            let queue = unsafe { DXGIGetDebugInterface1(0) }.unwrap();
-            let thread = None;
+            let queue: IDXGIInfoQueue = unsafe { DXGIGetDebugInterface1(0) }.unwrap();
+
+            let filter = DXGI_INFO_QUEUE_FILTER {
+                ..Default::default()
+            };
+
+            unsafe {
+                let _ = queue.SetBreakOnSeverity(
+                    PRODUCER,
+                    DXGI_INFO_QUEUE_MESSAGE_SEVERITY_CORRUPTION,
+                    true,
+                );
+
+                let _ = queue.SetBreakOnSeverity(
+                    PRODUCER,
+                    DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR,
+                    true,
+                );
+
+                let _ = queue.AddStorageFilterEntries(PRODUCER, &filter);
+            }
+
+            let queue = Arc::new(IDXGIInfoQueueSync(queue));
+
+            let thread = {
+                let queue = Arc::downgrade(&queue);
+                Some(std::thread::spawn(move || {
+                    const TIMEOUT: f32 = 1.0 / 60.0;
+
+                    let max = unsafe { queue.upgrade().unwrap().0.GetMessageCountLimit(PRODUCER) };
+                    println!("MAX {max}");
+                    let mut i = 0;
+
+                    while let Some(queue) = queue.upgrade() {
+                        let queue = &queue.0;
+
+                        let stored = unsafe { queue.GetNumStoredMessages(PRODUCER) };
+                        // println!("STORED {stored}");
+                        while stored <= max && i < stored {
+                            let mut size = 0;
+                            // SAFETY:
+                            let _ = unsafe { queue.GetMessage(PRODUCER, i, None, &mut size) };
+
+                            let (msg, msg_layout): (*mut DXGI_INFO_QUEUE_MESSAGE, _) = {
+                                let align = std::mem::align_of::<DXGI_INFO_QUEUE_MESSAGE>();
+                                let layout = Layout::from_size_align(size, align).unwrap();
+                                let msg = unsafe { std::alloc::alloc_zeroed(layout) as *mut _ };
+                                (msg, layout)
+                            };
+
+                            // SAFETY:
+                            let r = unsafe { queue.GetMessage(PRODUCER, i, Some(msg), &mut size) };
+                            if r.is_ok() {
+                                let s = unsafe { CStr::from_ptr((*msg).pDescription as *mut _) };
+                                println!("{:?}", s.to_str().unwrap());
+                            }
+
+                            // SAFETY
+                            unsafe { std::alloc::dealloc(msg as *mut _, msg_layout) };
+
+                            i += 1;
+                        }
+
+                        std::thread::park_timeout(Duration::from_secs_f32(TIMEOUT));
+                    }
+                }))
+            };
 
             Some(InstanceDebugger {
                 dxgi: (controller, queue),
@@ -85,6 +161,15 @@ impl Instance {
     pub fn new_device(&self, surface: Option<&Surface>, props: &DeviceProps) -> Result<Device> {
         let InstanceShared { debugger, .. } = &*self.0;
 
+        if let Some(debugger) = debugger {
+            let queue = &debugger.dxgi.1;
+            unsafe {
+                queue
+                    .0
+                    .AddApplicationMessage(DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR, s!("Hello"))
+            };
+        }
+
         if debugger.is_some() {
             let mut controller: Option<ID3D12Debug1> = None;
             unsafe { D3D12GetDebugInterface(&mut controller) }.unwrap();
@@ -100,22 +185,24 @@ impl Instance {
         let device: ID3D12Device = unsafe { device.unwrap_unchecked() };
         let device: ID3D12Device8 = device.cast().unwrap();
 
-        if debugger.is_some() {
-            if let Ok(queue) = device.cast::<ID3D12InfoQueue1>() {
-                let mut cookie = 0;
-                unsafe {
-                    queue.RegisterMessageCallback(
-                        Some(Self::debug_callback),
-                        D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS,
-                        std::ptr::null(),
-                        &mut cookie,
-                    )
-                }
-                .unwrap();
+        // if debugger.is_some() {
+        //     if let Ok(queue) = device.cast::<ID3D12InfoQueue1>() {
+        //         let mut cookie = 0;
+        //         unsafe {
+        //             queue.RegisterMessageCallback(
+        //                 Some(Self::debug_callback),
+        //                 D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS,
+        //                 std::ptr::null(),
+        //                 &mut cookie,
+        //             )
+        //         }
+        //         .unwrap();
 
-                println!("Enabled Device MessageCallback!");
-            }
-        }
+        //         println!("Enabled Device MessageCallback!");
+        //     } else {
+        //         std::thread::spawn(|| {});
+        //     }
+        // }
 
         let present: ID3D12CommandQueue = {
             let desc = D3D12_COMMAND_QUEUE_DESC {
