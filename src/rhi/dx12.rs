@@ -13,14 +13,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::{s, w};
 
-use super::queue::{QueueKind, QueueType};
-use super::{DeviceProps, ImageProps};
 use crate::os::windows::WindowExt;
 use crate::os::Window;
-use crate::rhi::{
-    self, BufferLayout, BufferUsage, BufferUsageType, Error, Format, FormatType, ImageUsage,
-    ImageUsageType, Result,
-};
+use crate::rhi::queue::{QueueKind, QueueType};
+use crate::rhi::state::{Executeable, Initial, Recording, State};
+use crate::rhi::usage::{BufferUsage, ImageUsage, ImageUsageType};
+use crate::rhi::{self, BufferLayout, DeviceProps, Error, Format, FormatType, ImageProps, Result};
 
 struct InstanceDebugger {
     dxgi: (IDXGIDebug, Arc<IDXGIInfoQueueSync>),
@@ -359,7 +357,7 @@ impl Device {
         })
     }
 
-    pub fn new_command_list<K>(&self, _pool: &mut CommandPool<K>) -> Result<CommandList>
+    pub fn new_command_list<K>(&self, _: &mut CommandPool<K>) -> Result<CommandList<K, Initial>>
     where
         K: QueueKind,
     {
@@ -374,6 +372,7 @@ impl Device {
         Ok(CommandList {
             list,
             _device: Arc::clone(&self.0),
+            _marker: PhantomData,
         })
     }
 
@@ -585,9 +584,10 @@ impl<'a, K: QueueKind> TryFrom<&'a mut rhi::CommandPool<K>> for &'a mut CommandP
     }
 }
 
-pub struct CommandList {
+pub struct CommandList<K: QueueKind, S: State> {
     list: ID3D12GraphicsCommandList6,
     _device: Arc<DeviceShared>,
+    _marker: PhantomData<(K, S)>,
 }
 
 pub struct Buffer<T: BufferLayout, U: BufferUsage> {
