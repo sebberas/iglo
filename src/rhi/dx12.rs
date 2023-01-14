@@ -1,4 +1,5 @@
 use std::alloc::*;
+use std::borrow::Cow;
 use std::ffi::*;
 use std::marker::*;
 use std::sync::*;
@@ -6,19 +7,32 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use windows::core::{Interface, GUID, PCSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND};
+use windows::Win32::Foundation::{HINSTANCE, HWND, *};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::{s, w};
 
+use super::Fullscreen;
 use crate::os::windows::WindowExt;
 use crate::os::Window;
-use crate::rhi::queue::{QueueKind, QueueType};
-use crate::rhi::state::{Executeable, Initial, Recording, State};
-use crate::rhi::usage::{BufferUsage, ImageUsage, ImageUsageType};
+use crate::rhi::macros::*;
+use crate::rhi::queue::{self, QueueKind, QueueType};
+use crate::rhi::state::{Executable, Initial, Recording, State};
+use crate::rhi::usage::{self, BufferUsage, ImageUsage, ImageUsageType};
 use crate::rhi::{self, BufferLayout, DeviceProps, Error, Format, FormatType, ImageProps, Result};
+
+impl From<windows::core::Error> for Error {
+    fn from(value: windows::core::Error) -> Self {
+        match value.code() {
+            E_OUTOFMEMORY => Error::OutOfHostMemory,
+            E_NOINTERFACE | E_NOTIMPL => Error::NotSupported,
+            E_ABORT | E_FAIL | E_UNEXPECTED => Error::Unknown,
+            _ => Error::Other(Cow::Owned(value.to_string())),
+        }
+    }
+}
 
 struct InstanceDebugger {
     dxgi: (IDXGIDebug, Arc<IDXGIInfoQueueSync>),
@@ -57,8 +71,8 @@ impl Instance {
     pub fn new(debug: bool) -> Result<Self> {
         let debugger = if debug {
             const PRODUCER: GUID = DXGI_DEBUG_ALL;
-            let controller: IDXGIDebug = unsafe { DXGIGetDebugInterface1(0) }.unwrap();
-            let queue: IDXGIInfoQueue = unsafe { DXGIGetDebugInterface1(0) }.unwrap();
+            let controller: IDXGIDebug = unsafe { DXGIGetDebugInterface1(0) }?;
+            let queue: IDXGIInfoQueue = unsafe { DXGIGetDebugInterface1(0) }?;
 
             let filter = DXGI_INFO_QUEUE_FILTER {
                 ..Default::default()
@@ -88,7 +102,6 @@ impl Instance {
                     const TIMEOUT: f32 = 1.0 / 60.0;
 
                     let max = unsafe { queue.upgrade().unwrap().0.GetMessageCountLimit(PRODUCER) };
-                    println!("MAX {max}");
                     let mut i = 0;
 
                     while let Some(queue) = queue.upgrade() {
@@ -135,8 +148,8 @@ impl Instance {
         };
 
         let flags = if debug { DXGI_CREATE_FACTORY_DEBUG } else { 0 };
-        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(flags).unwrap() };
-        let factory: IDXGIFactory7 = factory.cast().unwrap();
+        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(flags) }?;
+        let factory: IDXGIFactory7 = factory.cast()?;
 
         Ok(Self(Arc::new(InstanceShared { factory, debugger })))
     }
@@ -159,18 +172,9 @@ impl Instance {
     pub fn new_device(&self, surface: Option<&Surface>, props: &DeviceProps) -> Result<Device> {
         let InstanceShared { debugger, .. } = &*self.0;
 
-        if let Some(debugger) = debugger {
-            let queue = &debugger.dxgi.1;
-            unsafe {
-                queue
-                    .0
-                    .AddApplicationMessage(DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR, s!("Hello"))
-            };
-        }
-
         if debugger.is_some() {
             let mut controller: Option<ID3D12Debug1> = None;
-            unsafe { D3D12GetDebugInterface(&mut controller) }.unwrap();
+            unsafe { D3D12GetDebugInterface(&mut controller) }?;
             if let Some(controller) = controller {
                 println!("Enabled Device Debugging!");
                 unsafe { controller.EnableDebugLayer() };
@@ -178,29 +182,10 @@ impl Instance {
         }
 
         let mut device = None;
-        unsafe { D3D12CreateDevice(None, Self::FEATURE_LEVEL, &mut device) }.unwrap();
+        unsafe { D3D12CreateDevice(None, Self::FEATURE_LEVEL, &mut device) }?;
 
         let device: ID3D12Device = unsafe { device.unwrap_unchecked() };
-        let device: ID3D12Device8 = device.cast().unwrap();
-
-        // if debugger.is_some() {
-        //     if let Ok(queue) = device.cast::<ID3D12InfoQueue1>() {
-        //         let mut cookie = 0;
-        //         unsafe {
-        //             queue.RegisterMessageCallback(
-        //                 Some(Self::debug_callback),
-        //                 D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS,
-        //                 std::ptr::null(),
-        //                 &mut cookie,
-        //             )
-        //         }
-        //         .unwrap();
-
-        //         println!("Enabled Device MessageCallback!");
-        //     } else {
-        //         std::thread::spawn(|| {});
-        //     }
-        // }
+        let device: ID3D12Device8 = device.cast()?;
 
         let present: ID3D12CommandQueue = {
             let desc = D3D12_COMMAND_QUEUE_DESC {
@@ -210,7 +195,7 @@ impl Instance {
                 NodeMask: 0,
             };
 
-            unsafe { device.CreateCommandQueue(&desc) }.unwrap()
+            unsafe { device.CreateCommandQueue(&desc) }?
         };
 
         let _ = unsafe { present.SetName(w!("Present ID3D12CommandQueue")) };
@@ -222,7 +207,10 @@ impl Instance {
         })))
     }
 
-    pub fn new_swapchain(&self, device: &Device, surface: Surface) -> Result<Swapchain> {
+    pub fn new_swapchain<F>(&self, device: &Device, surface: Surface) -> Result<Swapchain<F>>
+    where
+        F: Format,
+    {
         let InstanceShared { factory, .. } = &*self.0;
         let DeviceShared { present, .. } = &*device.0;
         let Surface { hwnd, .. } = surface;
@@ -230,7 +218,11 @@ impl Instance {
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: 0,
             Height: 0,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: match F::FORMAT_TYPE {
+                FormatType::Unknown => panic!("Unable to create swapchain with an unknown format"),
+                FormatType::R8G8B8A8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM,
+                format => format.into(),
+            },
             Stereo: false.into(),
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -249,13 +241,10 @@ impl Instance {
             ..Default::default()
         };
 
-        let handle = unsafe {
-            factory
-                .CreateSwapChainForHwnd(present, hwnd, &desc, Some(&fdesc), None)
-                .unwrap()
-        };
+        let handle =
+            unsafe { factory.CreateSwapChainForHwnd(present, hwnd, &desc, Some(&fdesc), None)? };
 
-        let handle: IDXGISwapChain4 = handle.cast().unwrap();
+        let handle: IDXGISwapChain4 = handle.cast()?;
 
         Ok(Swapchain(Arc::new(SwapchainShared {
             handle,
@@ -263,20 +252,8 @@ impl Instance {
             backbuffers: 2,
             _device: Arc::clone(&device.0),
             _instance: Arc::clone(&self.0),
+            _marker: PhantomData,
         })))
-    }
-
-    extern "system" fn debug_callback(
-        _category: D3D12_MESSAGE_CATEGORY,
-        severity: D3D12_MESSAGE_SEVERITY,
-        _id: D3D12_MESSAGE_ID,
-        description: PCSTR,
-        _: *mut c_void,
-    ) {
-        if severity.0 <= 2 {
-            let s = unsafe { description.to_string() }.unwrap();
-            println!("{s}");
-        }
     }
 }
 
@@ -286,27 +263,7 @@ pub struct Surface {
     _instance: Arc<InstanceShared>,
 }
 
-impl TryFrom<rhi::Surface> for Surface {
-    type Error = Error;
-
-    fn try_from(value: rhi::Surface) -> Result<Self> {
-        match value {
-            rhi::Surface::DX12(surface) => Ok(surface),
-            _ => Err(Error::BackendMismatch),
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a rhi::Surface> for &'a Surface {
-    type Error = Error;
-
-    fn try_from(value: &'a rhi::Surface) -> Result<Self> {
-        match value {
-            rhi::Surface::DX12(surface) => Ok(surface),
-            _ => Err(Error::BackendMismatch),
-        }
-    }
-}
+impl_try_from_rhi_all!(DX12, Surface);
 
 struct DeviceShared {
     device: ID3D12Device8,
@@ -341,14 +298,13 @@ impl Device {
         }))
     }
 
-    pub fn new_command_pool<K>(&self, queue: &CommandQueue<K>) -> Result<CommandPool<K>>
+    pub fn new_command_pool<K>(&self, _queue: &CommandQueue<K>) -> Result<CommandPool<K>>
     where
         K: QueueKind,
     {
         let DeviceShared { device, .. } = &*self.0;
 
-        let allocator =
-            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+        let allocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
 
         Ok(CommandPool {
             allocator,
@@ -366,8 +322,8 @@ impl Device {
         let kind = D3D12_COMMAND_LIST_TYPE_DIRECT;
         let flags = D3D12_COMMAND_LIST_FLAG_NONE;
 
-        let list: ID3D12CommandList = unsafe { device.CreateCommandList1(0, kind, flags) }.unwrap();
-        let list = list.cast().unwrap();
+        let list: ID3D12CommandList = unsafe { device.CreateCommandList1(0, kind, flags)? };
+        let list: ID3D12GraphicsCommandList6 = list.cast()?;
 
         Ok(CommandList {
             list,
@@ -411,16 +367,14 @@ impl Device {
 
         let mut resource: Option<ID3D12Resource> = None;
         unsafe {
-            device
-                .CreateCommittedResource(
-                    &heap_props,
-                    heap_flags,
-                    &buffer_desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut resource,
-                )
-                .unwrap()
+            device.CreateCommittedResource(
+                &heap_props,
+                heap_flags,
+                &buffer_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut resource,
+            )?
         };
 
         todo!()
@@ -456,24 +410,23 @@ impl Device {
                 },
                 Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
                 Flags: match U::USAGE_TYPE {
-                    ImageUsageType::Unknown => {
-                        panic!("Images cannot be created with an unknown format")
-                    }
                     ImageUsageType::DepthStencil => D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                    ImageUsageType::RenderTarget => D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ImageUsageType::Unknown => {
+                        panic!("Images cannot be created with an unknown usage")
+                    }
                 },
             };
 
             unsafe {
-                let result = device.CreateCommittedResource(
+                device.CreateCommittedResource(
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
                     &mut resource,
-                );
-
-                result.unwrap();
+                )?;
             }
         }
 
@@ -489,39 +442,40 @@ impl Device {
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
-impl TryFrom<rhi::Device> for Device {
-    type Error = Error;
+impl_try_from_rhi_all!(DX12, Device);
 
-    fn try_from(value: rhi::Device) -> Result<Self> {
-        match value {
-            rhi::Device::DX12(inner) => Ok(inner),
-            _ => Err(Error::BackendMismatch),
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a rhi::Device> for &'a Device {
-    type Error = Error;
-
-    fn try_from(value: &'a rhi::Device) -> Result<Self> {
-        match value {
-            rhi::Device::DX12(inner) => Ok(inner),
-            _ => Err(Error::BackendMismatch),
-        }
-    }
-}
-
-struct SwapchainShared {
+struct SwapchainShared<F: Format> {
     handle: IDXGISwapChain4,
     present: ID3D12CommandQueue,
     backbuffers: u32,
     _device: Arc<DeviceShared>,
     _instance: Arc<InstanceShared>,
+    _marker: PhantomData<F>,
 }
 
-pub struct Swapchain(Arc<SwapchainShared>);
+pub struct Swapchain<F: Format>(Arc<SwapchainShared<F>>);
 
-impl Swapchain {
+impl<F: Format> Swapchain<F> {
+    pub fn set_fullscreen(&mut self, state: Fullscreen) -> Result<()> {
+        let SwapchainShared { handle, .. } = &*self.0;
+
+        let fullscreen = matches!(state, Fullscreen::Fullscreen);
+        unsafe { handle.SetFullscreenState(fullscreen, None) }?;
+        unsafe { handle.ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0) }?;
+        Ok(())
+    }
+
+    pub fn image(&mut self, _timeout: Duration) -> Result<Option<Image<F, usage::RenderTarget>>> {
+        let SwapchainShared { handle, .. } = &*self.0;
+
+        let resource: ID3D12Resource = unsafe { handle.GetBuffer(0) }?;
+
+        Ok(Some(Image {
+            resource,
+            _marker: PhantomData,
+        }))
+    }
+
     pub fn present(&mut self) -> Result<()> {
         let SwapchainShared { handle, .. } = &*self.0;
 
@@ -532,12 +486,11 @@ impl Swapchain {
             pScrollOffset: std::ptr::null_mut(),
         };
 
+        // TODO: Avoid unwrap
         unsafe { handle.Present1(1, DXGI_PRESENT_RESTART, &params) }.unwrap();
         Ok(())
     }
 }
-
-pub struct RenderTarget {}
 
 pub struct CommandQueue<K: QueueKind> {
     queue: ID3D12CommandQueue,
@@ -545,16 +498,7 @@ pub struct CommandQueue<K: QueueKind> {
     _marker: PhantomData<K>,
 }
 
-impl<'a, K: QueueKind> TryFrom<&'a rhi::CommandQueue<K>> for &'a CommandQueue<K> {
-    type Error = Error;
-
-    fn try_from(value: &'a rhi::CommandQueue<K>) -> Result<Self> {
-        match value {
-            rhi::CommandQueue::DX12(q) => Ok(q),
-            _ => Err(Error::BackendMismatch),
-        }
-    }
-}
+impl_try_from_rhi_all!(DX12, CommandQueue<K: QueueKind>);
 
 pub struct CommandPool<K: QueueKind> {
     allocator: ID3D12CommandAllocator,
@@ -562,38 +506,56 @@ pub struct CommandPool<K: QueueKind> {
     _marker: PhantomData<K>,
 }
 
-impl<'a, K: QueueKind> TryFrom<&'a rhi::CommandPool<K>> for &'a CommandPool<K> {
-    type Error = Error;
+impl_try_from_rhi_all!(DX12, CommandPool<K: QueueKind>);
 
-    fn try_from(value: &'a rhi::CommandPool<K>) -> Result<Self> {
-        match value {
-            rhi::CommandPool::DX12(p) => Ok(p),
-            _ => Err(Error::BackendMismatch),
-        }
-    }
-}
-
-impl<'a, K: QueueKind> TryFrom<&'a mut rhi::CommandPool<K>> for &'a mut CommandPool<K> {
-    type Error = Error;
-
-    fn try_from(value: &'a mut rhi::CommandPool<K>) -> Result<Self> {
-        match value {
-            rhi::CommandPool::DX12(p) => Ok(p),
-            _ => Err(Error::BackendMismatch),
-        }
-    }
-}
-
-pub struct CommandList<K: QueueKind, S: State> {
+pub struct CommandList<'a, K: QueueKind, S: State> {
     list: ID3D12GraphicsCommandList6,
     _device: Arc<DeviceShared>,
-    _marker: PhantomData<(K, S)>,
+    _marker: PhantomData<(&'a (), K, S)>,
 }
+
+impl<'a> CommandList<'a, queue::Graphics, Recording> {
+    pub fn bind_vertex_buffer<T>(&mut self, slot: usize, buf: &'a Buffer<T, usage::VertexBuffer>)
+    where
+        T: BufferLayout,
+    {
+    }
+
+    pub fn bind_index_buffer_u16(&mut self, buf: &Buffer<u16, usage::IndexBuffer>) {
+        let view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: todo!(),
+            SizeInBytes: todo!(),
+            Format: DXGI_FORMAT_R16_UINT,
+        };
+
+        unsafe { self.list.IASetIndexBuffer(Some(&view)) };
+    }
+
+    pub fn bind_index_buffer_u32(&mut self, buf: &Buffer<u32, usage::IndexBuffer>) {
+        let view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: todo!(),
+            SizeInBytes: todo!(),
+            Format: DXGI_FORMAT_R32_UINT,
+        };
+
+        unsafe { self.list.IASetIndexBuffer(Some(&view)) };
+    }
+}
+
+impl<'a> CommandList<'a, queue::Graphics, Executable> {}
+
+pub struct RenderTarget<F: Format> {
+    image: Image<F, usage::RenderTarget>,
+}
+
+pub struct RenderPass {}
 
 pub struct Buffer<T: BufferLayout, U: BufferUsage> {
     resource: ID3D12Resource2,
     _marker: PhantomData<(T, U)>,
 }
+
+impl_try_from_rhi_all!(DX12, Buffer<T: BufferLayout, U: BufferUsage>);
 
 pub struct Image<F: Format, U: ImageUsage> {
     resource: ID3D12Resource,
@@ -611,11 +573,13 @@ impl From<FormatType> for DXGI_FORMAT {
         match value {
             Unknown => DXGI_FORMAT_UNKNOWN,
 
+            R8 => DXGI_FORMAT_R8_TYPELESS,
             R8Unorm => DXGI_FORMAT_R8_UNORM,
             R8Snorm => DXGI_FORMAT_R8_SNORM,
             R8Uint => DXGI_FORMAT_R8_UINT,
             R8Sint => DXGI_FORMAT_R8_SINT,
 
+            R16 => DXGI_FORMAT_R16_TYPELESS,
             R16Unorm => DXGI_FORMAT_R16_UNORM,
             R16Snorm => DXGI_FORMAT_R16_SNORM,
             R16Uint => DXGI_FORMAT_R16_UINT,
@@ -624,17 +588,20 @@ impl From<FormatType> for DXGI_FORMAT {
 
             D16Unorm => DXGI_FORMAT_D16_UNORM,
 
+            R32 => DXGI_FORMAT_R32_TYPELESS,
             R32Uint => DXGI_FORMAT_R32_UINT,
             R32Sint => DXGI_FORMAT_R32_SINT,
             R32Float => DXGI_FORMAT_R32_FLOAT,
 
             D32Float => DXGI_FORMAT_D32_FLOAT,
 
+            R8G8 => DXGI_FORMAT_R8G8_TYPELESS,
             R8G8Unorm => DXGI_FORMAT_R8G8_UNORM,
             R8G8Snorm => DXGI_FORMAT_R8G8_SNORM,
             R8G8Uint => DXGI_FORMAT_R8G8_UINT,
             R8G8Sint => DXGI_FORMAT_R8G8_SINT,
 
+            R16G16 => DXGI_FORMAT_R16G16_TYPELESS,
             R16G16Unorm => DXGI_FORMAT_R16G16_UNORM,
             R16G16Snorm => DXGI_FORMAT_R16G16_SNORM,
             R16G16Uint => DXGI_FORMAT_R16G16_UINT,
@@ -643,31 +610,37 @@ impl From<FormatType> for DXGI_FORMAT {
 
             D24UnormS8Uint => DXGI_FORMAT_D24_UNORM_S8_UINT,
 
+            R32G32 => DXGI_FORMAT_R32G32_TYPELESS,
             R32G32Uint => DXGI_FORMAT_R32G32_UINT,
             R32G32Sint => DXGI_FORMAT_R32G32_SINT,
             R32G32Float => DXGI_FORMAT_R32G32_FLOAT,
 
             R11G11B10Float => DXGI_FORMAT_R11G11B10_FLOAT,
 
+            R32G32B32 => DXGI_FORMAT_R32G32B32_TYPELESS,
             R32G32B32Uint => DXGI_FORMAT_R32G32B32_UINT,
             R32G32B32Sint => DXGI_FORMAT_R32G32B32_SINT,
             R32G32B32Float => DXGI_FORMAT_R32G32B32_FLOAT,
 
+            R8G8B8A8 => DXGI_FORMAT_R8G8B8A8_TYPELESS,
             R8G8B8A8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
             R8G8B8A8Snorm => DXGI_FORMAT_R8G8B8A8_SNORM,
             R8G8B8A8Uint => DXGI_FORMAT_R8G8B8A8_UINT,
             R8G8B8A8Sint => DXGI_FORMAT_R8G8B8A8_SINT,
             R8G8B8A8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
 
+            R10G10B10A2 => DXGI_FORMAT_R10G10B10A2_TYPELESS,
             R10G10B10A2Unorm => DXGI_FORMAT_R10G10B10A2_UNORM,
             R10G10B10A2Uint => DXGI_FORMAT_R10G10B10A2_UINT,
 
+            R16G16B16A16 => DXGI_FORMAT_R16G16B16A16_TYPELESS,
             R16G16B16A16Unorm => DXGI_FORMAT_R16G16B16A16_UNORM,
             R16G16B16A16Snorm => DXGI_FORMAT_R16G16B16A16_SNORM,
             R16G16B16A16Uint => DXGI_FORMAT_R16G16B16A16_UINT,
             R16G16B16A16Sint => DXGI_FORMAT_R16G16B16A16_SINT,
             R16G16B16A16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
 
+            R32G32B32A32 => DXGI_FORMAT_R32G32B32A32_TYPELESS,
             R32G32B32A32Uint => DXGI_FORMAT_R32G32B32A32_UINT,
             R32G32B32A32Sint => DXGI_FORMAT_R32G32B32A32_SINT,
             R32G32B32A32Float => DXGI_FORMAT_R32G32B32A32_FLOAT,

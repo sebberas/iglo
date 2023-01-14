@@ -8,4 +8,5 @@
 
 pub mod core;
 pub mod os;
+pub mod renderer;
 pub mod rhi;

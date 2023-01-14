@@ -10,6 +10,7 @@
 //! RenderTarget
 //! RenderPass
 //! ComputePass
+//! GraphicsPipeline
 //! ComputePipeline
 //! Memory
 //! Buffer + BufferView
@@ -25,8 +26,10 @@
 //!
 //! Raytracing
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use self::format::{Format, FormatType};
 use self::queue::QueueKind;
@@ -38,13 +41,84 @@ pub mod dx12;
 
 pub mod spirv;
 
+mod macros {
+    macro_rules! impl_try_from_rhi {
+        ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
+            impl $(<$($arg $(: $bound)?),*>)? TryFrom <$crate::rhi::$type$(<$($arg),*>)?> for $type$(<$($arg),*>)? {
+                type Error = $crate::rhi::Error;
+
+                fn try_from(o: $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                    match o {
+                        $crate::rhi::$type::$match(o) => Ok(o),
+                        _ => Err(Self::Error::BackendMismatch),
+                    }
+                }
+            }
+        };
+    }
+
+    macro_rules! impl_try_from_rhi_ref {
+        ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
+            impl <'a, $($($arg $(: $bound)?),*)?> TryFrom <&'a $crate::rhi::$type$(<$($arg),*>)?> for &'a $type$(<$($arg),*>)? {
+                type Error = $crate::rhi::Error;
+
+                fn try_from(o: &'a $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                    match o {
+                        $crate::rhi::$type::$match(o) => Ok(o),
+                        _ => Err(Self::Error::BackendMismatch),
+                    }
+                }
+            }
+        };
+    }
+
+    macro_rules! impl_try_from_rhi_mut {
+        ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
+            impl <'a, $($($arg $(: $bound)?),*)?> TryFrom <&'a mut $crate::rhi::$type$(<$($arg),*>)?> for &'a mut $type$(<$($arg),*>)? {
+                type Error = $crate::rhi::Error;
+
+                fn try_from(o: &'a mut $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                    match o {
+                        $crate::rhi::$type::$match(o) => Ok(o),
+                        _ => Err(Self::Error::BackendMismatch),
+                    }
+                }
+            }
+        };
+    }
+
+    macro_rules! impl_try_from_rhi_all {
+        ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
+            impl_try_from_rhi!($match, $type $(<$($arg $(: $bound)?),*>)?);
+            impl_try_from_rhi_ref!($match, $type $(<$($arg $(: $bound)?),*>)?);
+            impl_try_from_rhi_mut!($match, $type $(<$($arg $(: $bound)?),*>)?);
+        };
+    }
+
+    pub(crate) use {
+        impl_try_from_rhi, impl_try_from_rhi_all, impl_try_from_rhi_mut, impl_try_from_rhi_ref,
+    };
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    OutOfHostMemory,
+    OutOfDeviceMemory,
+    TooManyObjects,
+    LayerNotPresent,
+    ExtensionNotPresent,
+    FeatureNotPresent,
+    NotSupported,
+    Unknown,
+
+    Other(Cow<'static, String>),
+
     BackendMismatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Backend {
     DX12,
 }
@@ -69,6 +143,7 @@ impl Instance {
         }
     }
 
+    /// Creates a new device
     pub fn new_device(&self, props: &DeviceProps) -> Result<Device> {
         match self {
             Self::DX12(i) => {
@@ -78,10 +153,22 @@ impl Instance {
         }
     }
 
-    pub fn new_swapchain(&self, device: &Device, surface: Surface) -> Result<Swapchain> {
+    /// Creates a new swapchain with specified format
+    ///
+    /// # Panics
+    ///
+    /// Panics if the format is [`Unknown`]
+    pub fn new_swapchain<'a, F>(
+        &self,
+        props: impl Into<SwapchainProps<'a, F>>,
+    ) -> Result<Swapchain<F>>
+    where
+        F: Format,
+    {
+        let props = props.into();
         match self {
             Self::DX12(i) => {
-                let (device, surface) = (device.try_into(), surface.try_into());
+                let (device, surface) = (props.device.try_into(), props.surface.try_into());
                 i.new_swapchain(device?, surface?).map(Swapchain::DX12)
             }
         }
@@ -229,19 +316,97 @@ impl Device {
     }
 }
 
-pub struct SwapchainCreateInfo<F: Format> {
+pub struct SwapchainProps<'a, F: Format> {
+    pub device: &'a Device,
     pub surface: Surface,
-    pub width: Option<usize>,
-    pub height: Option<usize>,
-    pub backbuffers: usize,
+    pub width: Option<NonZeroUsize>,
+    pub height: Option<NonZeroUsize>,
+    pub backbuffers: NonZeroUsize,
     pub format: F,
 }
 
-pub enum Swapchain {
-    DX12(dx12::Swapchain),
+impl<'a, F: Format> SwapchainProps<'a, F> {
+    pub fn new(device: &'a Device, surface: Surface, format: F) -> Self {
+        Self {
+            device,
+            surface,
+            width: None,
+            height: None,
+            backbuffers: unsafe { NonZeroUsize::new_unchecked(2) },
+            format,
+        }
+    }
 }
 
-impl Swapchain {
+impl<'a> SwapchainProps<'a, format::Unknown> {
+    pub fn builder(device: &'a Device, surface: Surface) -> SwapchainPropsBuilder<format::Unknown> {
+        SwapchainPropsBuilder(Self::new(device, surface, format::Unknown))
+    }
+}
+
+pub struct SwapchainPropsBuilder<'a, F: Format>(SwapchainProps<'a, F>);
+
+impl<'a, F: Format> SwapchainPropsBuilder<'a, F> {
+    pub fn width(mut self, width: NonZeroUsize) -> Self {
+        self.0.width = Some(width);
+        self
+    }
+
+    pub fn height(mut self, height: NonZeroUsize) -> Self {
+        self.0.height = Some(height);
+        self
+    }
+
+    pub fn backbuffers(mut self, n: NonZeroUsize) -> Self {
+        self.0.backbuffers = n;
+        self
+    }
+
+    pub fn format<F2: Format>(self, format: F2) -> SwapchainPropsBuilder<'a, F2> {
+        SwapchainPropsBuilder(SwapchainProps {
+            device: self.0.device,
+            surface: self.0.surface,
+            width: self.0.width,
+            height: self.0.height,
+            backbuffers: self.0.backbuffers,
+            format,
+        })
+    }
+
+    pub fn build(self) -> SwapchainProps<'a, F> {
+        self.0
+    }
+}
+
+impl<'a, F: Format> From<SwapchainPropsBuilder<'a, F>> for SwapchainProps<'a, F> {
+    fn from(value: SwapchainPropsBuilder<'a, F>) -> SwapchainProps<'a, F> {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fullscreen {
+    Fullscreen,
+    Windowed,
+}
+
+pub enum Swapchain<F: Format> {
+    DX12(dx12::Swapchain<F>),
+}
+
+impl<F: Format> Swapchain<F> {
+    pub fn set_fullscreen(&mut self, state: Fullscreen) -> Result<()> {
+        match self {
+            Self::DX12(s) => s.set_fullscreen(state),
+        }
+    }
+
+    pub fn image(&mut self, timeout: Duration) -> Result<Option<Image<F, usage::RenderTarget>>> {
+        match self {
+            Self::DX12(s) => s.image(timeout).map(|i| i.map(Image::DX12)),
+        }
+    }
+
     pub fn present(&mut self) -> Result<()> {
         match self {
             Self::DX12(s) => s.present(),
@@ -294,12 +459,46 @@ pub mod state {
     pub struct Recording;
     impl State for Recording {}
 
-    pub struct Executeable;
-    impl State for Executeable {}
+    pub struct Executable;
+    impl State for Executable {}
 }
 
-pub enum CommandList<K: QueueKind, S: State> {
-    DX12(dx12::CommandList<K, S>),
+pub enum CommandList<'a, K: QueueKind, S: State> {
+    DX12(dx12::CommandList<'a, K, S>),
+}
+
+impl<'a> CommandList<'a, queue::Graphics, state::Recording> {
+    pub fn bind_vertex_buffers<T>(&mut self, buf: &'a VertexBuffer<T>) -> &mut Self
+    where
+        T: BufferLayout + 'a,
+    {
+        match self {
+            Self::DX12(cl) => {}
+        }
+
+        self
+    }
+
+    // fn bind_index_buffer_u8(&mut self, buf: &Buffer<u8, usage::IndexBuffer>) {}
+    pub fn bind_index_buffer_u16(&mut self, buf: &IndexBuffer<u16>) -> &mut Self {
+        match self {
+            Self::DX12(cl) => {
+                let buf = buf.try_into();
+                cl.bind_index_buffer_u16(buf.unwrap());
+                self
+            }
+        }
+    }
+
+    pub fn bind_index_buffer_u32(&mut self, buf: &IndexBuffer<u32>) -> &mut Self {
+        match self {
+            Self::DX12(cl) => {
+                let buf = buf.try_into();
+                cl.bind_index_buffer_u32(buf.unwrap());
+                self
+            }
+        }
+    }
 }
 
 pub struct BufferProps<T: BufferLayout, U: BufferUsage> {
@@ -310,11 +509,20 @@ pub struct BufferProps<T: BufferLayout, U: BufferUsage> {
 }
 
 impl<T: BufferLayout, U: BufferUsage> BufferProps<T, U> {
-    pub fn new(width: NonZeroUsize, usage: U, memory: Option<Memory>) -> Self {
+    pub fn new(width: NonZeroUsize, usage: U) -> Self {
         Self {
             width,
             usage,
-            memory,
+            memory: None,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn new_with_memory(width: NonZeroUsize, usage: U, memory: Memory) -> Self {
+        Self {
+            width,
+            usage,
+            memory: Some(memory),
             _marker: PhantomData,
         }
     }
@@ -322,7 +530,7 @@ impl<T: BufferLayout, U: BufferUsage> BufferProps<T, U> {
 
 impl BufferProps<(), usage::Unknown> {
     pub fn builder() -> BufferPropsBuilder<(), usage::Unknown> {
-        BufferPropsBuilder(Self::new(NonZeroUsize::MIN, usage::Unknown, None))
+        BufferPropsBuilder(Self::new(NonZeroUsize::MIN, usage::Unknown))
     }
 }
 
@@ -374,14 +582,22 @@ impl<T: BufferLayout, U: BufferUsage> AsMut<BufferProps<T, U>> for BufferPropsBu
     }
 }
 
-pub unsafe trait BufferLayout: Sized {}
+///
+///
+/// # Safety
+pub unsafe trait BufferLayout: Copy {}
 
 unsafe impl BufferLayout for () {}
-unsafe impl BufferLayout for f32 {}
+unsafe impl BufferLayout for u8 {}
+unsafe impl BufferLayout for u16 {}
+unsafe impl BufferLayout for u32 {}
 
 pub enum Buffer<T: BufferLayout, U: BufferUsage> {
     DX12(dx12::Buffer<T, U>),
 }
+
+pub type VertexBuffer<T> = Buffer<T, usage::VertexBuffer>;
+pub type IndexBuffer<T> = Buffer<T, usage::IndexBuffer>;
 
 /// This structure contains all the necessary information for creating an
 /// image.
@@ -499,6 +715,7 @@ pub mod usage {
 
     generate_usages! {
         pub enum ImageUsageType : ImageUsage {
+            RenderTarget,
             DepthStencil,
         }
     }
@@ -539,11 +756,13 @@ pub mod format {
         pub enum FormatType {
             Unknown,
 
+            R8,
             R8Unorm,
             R8Snorm,
             R8Uint,
             R8Sint,
 
+            R16,
             R16Unorm,
             R16Snorm,
             R16Uint,
@@ -552,17 +771,20 @@ pub mod format {
 
             D16Unorm,
 
+            R32,
             R32Uint,
             R32Sint,
             R32Float,
 
             D32Float,
 
+            R8G8,
             R8G8Unorm,
             R8G8Snorm,
             R8G8Uint,
             R8G8Sint,
 
+            R16G16,
             R16G16Unorm,
             R16G16Snorm,
             R16G16Uint,
@@ -571,31 +793,37 @@ pub mod format {
 
             D24UnormS8Uint,
 
+            R32G32,
             R32G32Uint,
             R32G32Sint,
             R32G32Float,
 
             R11G11B10Float,
 
+            R32G32B32,
             R32G32B32Uint,
             R32G32B32Sint,
             R32G32B32Float,
 
+            R8G8B8A8,
             R8G8B8A8Unorm,
             R8G8B8A8Snorm,
             R8G8B8A8Uint,
             R8G8B8A8Sint,
             R8G8B8A8Srgb,
 
+            R10G10B10A2,
             R10G10B10A2Unorm,
             R10G10B10A2Uint,
 
+            R16G16B16A16,
             R16G16B16A16Unorm,
             R16G16B16A16Snorm,
             R16G16B16A16Uint,
             R16G16B16A16Sint,
             R16G16B16A16Float,
 
+            R32G32B32A32,
             R32G32B32A32Uint,
             R32G32B32A32Sint,
             R32G32B32A32Float,
