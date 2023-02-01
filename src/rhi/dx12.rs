@@ -14,6 +14,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::{s, w};
 
+use super::queue::Graphics;
 use super::Fullscreen;
 use crate::os::windows::WindowExt;
 use crate::os::Window;
@@ -514,6 +515,18 @@ pub struct CommandList<'a, K: QueueKind, S: State> {
     _marker: PhantomData<(&'a (), K, S)>,
 }
 
+impl<'a> CommandList<'a, Graphics, Initial> {
+    pub fn begin(self, pool: &mut CommandPool<Graphics>) -> CommandList<'a, Graphics, Recording> {
+        unsafe { self.list.Reset(&pool.allocator, None) }.unwrap();
+
+        CommandList {
+            list: self.list,
+            _device: self._device,
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<'a> CommandList<'a, queue::Graphics, Recording> {
     pub fn bind_vertex_buffer<T>(&mut self, slot: usize, buf: &'a Buffer<T, usage::VertexBuffer>)
     where
@@ -543,12 +556,11 @@ impl<'a> CommandList<'a, queue::Graphics, Recording> {
 }
 
 impl<'a> CommandList<'a, queue::Graphics, Executable> {}
+pub struct RenderPass {}
 
 pub struct RenderTarget<F: Format> {
     image: Image<F, usage::RenderTarget>,
 }
-
-pub struct RenderPass {}
 
 pub struct Buffer<T: BufferLayout, U: BufferUsage> {
     resource: ID3D12Resource2,

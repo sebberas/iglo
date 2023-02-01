@@ -10,7 +10,7 @@
 //! RenderTarget
 //! RenderPass
 //! ComputePass
-//! GraphicsPipeline
+//! RenderPipeline
 //! ComputePipeline
 //! Memory
 //! Buffer + BufferView
@@ -32,16 +32,27 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use self::format::{Format, FormatType};
-use self::queue::QueueKind;
-use self::state::{Initial, State};
+use self::queue::{Graphics, QueueKind};
+use self::state::{Initial, Recording, State};
 use self::usage::{BufferUsage, ImageUsage};
 use crate::os::Window;
 
 pub mod dx12;
+pub mod vulkan;
 
 pub mod spirv;
 
 mod macros {
+    macro_rules! impl_into_rhi {
+        ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
+            impl<$($($arg $(: $bound)?),*)?> From<$type$(<$($arg),*>)?> for $crate::rhi::$type$(<$($arg),*>)? {
+                fn from(o: $type) -> Self {
+                    $crate::rhi::$type::$match(o)
+                }
+            }
+        };
+    }
+
     macro_rules! impl_try_from_rhi {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
             impl $(<$($arg $(: $bound)?),*>)? TryFrom <$crate::rhi::$type$(<$($arg),*>)?> for $type$(<$($arg),*>)? {
@@ -89,14 +100,15 @@ mod macros {
 
     macro_rules! impl_try_from_rhi_all {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
-            impl_try_from_rhi!($match, $type $(<$($arg $(: $bound)?),*>)?);
-            impl_try_from_rhi_ref!($match, $type $(<$($arg $(: $bound)?),*>)?);
-            impl_try_from_rhi_mut!($match, $type $(<$($arg $(: $bound)?),*>)?);
+            $crate::rhi::macros::impl_try_from_rhi!($match, $type $(<$($arg $(: $bound)?),*>)?);
+            $crate::rhi::macros::impl_try_from_rhi_ref!($match, $type $(<$($arg $(: $bound)?),*>)?);
+            $crate::rhi::macros::impl_try_from_rhi_mut!($match, $type $(<$($arg $(: $bound)?),*>)?);
         };
     }
 
     pub(crate) use {
-        impl_try_from_rhi, impl_try_from_rhi_all, impl_try_from_rhi_mut, impl_try_from_rhi_ref,
+        impl_into_rhi, impl_try_from_rhi, impl_try_from_rhi_all, impl_try_from_rhi_mut,
+        impl_try_from_rhi_ref,
     };
 }
 
@@ -112,6 +124,8 @@ pub enum Error {
     FeatureNotPresent,
     NotSupported,
     Unknown,
+
+    DeviceLost,
 
     Other(Cow<'static, String>),
 
@@ -177,6 +191,7 @@ impl Instance {
 
 pub enum Surface {
     DX12(dx12::Surface),
+    Vulkan(vulkan::Surface),
 }
 
 #[derive(Default, Clone, Copy)]
@@ -305,13 +320,13 @@ impl Device {
     ///
     /// Returns a new image with the specified format and usage if the operation
     /// is successfull. Otherwise it returns an error.
-    pub fn new_image<F, U>(&self, p: &mut impl AsMut<ImageProps<F, U>>) -> Result<Image<F, U>>
+    pub fn new_image<F, U>(&self, props: &mut impl AsMut<ImageProps<F, U>>) -> Result<Image<F, U>>
     where
         F: Format,
         U: ImageUsage,
     {
         match self {
-            Self::DX12(d) => d.new_image(p.as_mut()).map(Image::DX12),
+            Self::DX12(d) => d.new_image(props.as_mut()).map(Image::DX12),
         }
     }
 }
@@ -467,6 +482,17 @@ pub enum CommandList<'a, K: QueueKind, S: State> {
     DX12(dx12::CommandList<'a, K, S>),
 }
 
+impl<'a> CommandList<'a, Graphics, Initial> {
+    pub fn begin(self, pool: &mut CommandPool<Graphics>) -> CommandList<'a, Graphics, Recording> {
+        match self {
+            Self::DX12(cl) => {
+                let pool = pool.try_into().unwrap();
+                CommandList::DX12(cl.begin(pool))
+            }
+        }
+    }
+}
+
 impl<'a> CommandList<'a, queue::Graphics, state::Recording> {
     pub fn bind_vertex_buffers<T>(&mut self, buf: &'a VertexBuffer<T>) -> &mut Self
     where
@@ -500,6 +526,8 @@ impl<'a> CommandList<'a, queue::Graphics, state::Recording> {
         }
     }
 }
+
+pub struct RenderPassProps {}
 
 pub struct BufferProps<T: BufferLayout, U: BufferUsage> {
     pub width: NonZeroUsize,
