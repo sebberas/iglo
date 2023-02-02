@@ -359,6 +359,12 @@ impl<'a> SwapchainProps<'a, format::Unknown> {
     }
 }
 
+impl<'a, F: Format> AsRef<SwapchainProps<'a, F>> for SwapchainProps<'a, F> {
+    fn as_ref(&self) -> &SwapchainProps<'a, F> {
+        self
+    }
+}
+
 pub struct SwapchainPropsBuilder<'a, F: Format>(SwapchainProps<'a, F>);
 
 impl<'a, F: Format> SwapchainPropsBuilder<'a, F> {
@@ -393,9 +399,9 @@ impl<'a, F: Format> SwapchainPropsBuilder<'a, F> {
     }
 }
 
-impl<'a, F: Format> From<SwapchainPropsBuilder<'a, F>> for SwapchainProps<'a, F> {
-    fn from(value: SwapchainPropsBuilder<'a, F>) -> SwapchainProps<'a, F> {
-        value.0
+impl<'a, F: Format> AsRef<SwapchainProps<'a, F>> for SwapchainPropsBuilder<'a, F> {
+    fn as_ref(&self) -> &SwapchainProps<'a, F> {
+        &self.0
     }
 }
 

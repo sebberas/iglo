@@ -1,10 +1,8 @@
 use std::ffi::*;
-use std::ops::{Bound, Range, RangeBounds};
-use std::slice::SliceIndex;
+use std::ops::Range;
 use std::sync::*;
 
 use ash::extensions::*;
-use ash::vk::Handle;
 use ash::{vk, Entry};
 
 use crate::rhi::macros::*;
@@ -36,6 +34,12 @@ struct InstanceShared {
     entry: Entry,
     instance: ash::Instance,
     physical_devices: Vec<vk::PhysicalDevice>,
+}
+
+impl InstanceShared {
+    fn raw(&self) -> &ash::Instance {
+        &self.instance
+    }
 }
 
 pub struct Instance(Arc<InstanceShared>);
@@ -102,13 +106,12 @@ impl Instance {
     pub fn enumerate_adapters(&self) -> impl Iterator<Item = Adapter> + '_ {
         let physical_devices = &self.0.physical_devices;
 
-        physical_devices
-            .iter()
-            .enumerate()
-            .map(|(physical_device_index, _)| Adapter {
-                physical_device_index,
-                _instance: Arc::clone(&self.0),
-            })
+        let to_adapter = |(physical_device_index, _)| Adapter {
+            physical_device_index,
+            _instance: Arc::clone(&self.0),
+        };
+
+        physical_devices.iter().enumerate().map(to_adapter)
     }
 
     /// Creates a new device
@@ -125,68 +128,95 @@ impl Instance {
         let InstanceShared { instance, .. } = &*self.0;
         let physical_devices = &self.0.physical_devices;
 
-        let adapter = props.adapter.unwrap_or_else(|| todo!());
-        let surface = props.surface.unwrap_or_else(|| todo!());
+        let adapter = props.adapter.as_ref().unwrap_or_else(|| todo!());
+        let surface = props.surface.as_ref().unwrap_or_else(|| todo!());
         assert!(adapter.is_surface_supported(surface)?);
 
         let physical_device = physical_devices[adapter.physical_device_index];
 
-        // TODO: Abstract into a few functions.
-        let queue_create_infos = {
-            use vk::{DeviceQueueCreateInfo, QueueFamilyProperties};
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
-            let queue_family_props =
-                unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_family_indices = Adapter::find_queue_family_indices(&queue_families);
+        let queue_create_infos =
+            Self::setup_queue_create_infos(&queue_families, &queue_family_indices)?;
 
-            let QueueFamilyIndices {
-                graphics_family_index,
-                compute_family_index,
-                transfer_family_index,
-            } = Adapter::find_queue_family_indices(&queue_family_props);
+        let enabled_layer_names =
+            Vec::from(Adapter::REQUIRED_LAYER_NAMES.map(|name| name.as_ptr()));
 
-            let mut queue_create_infos = Vec::with_capacity(3);
-            let mut graphics_queue_priorities = Vec::default();
-
-            {
-                let queue_family_index = graphics_family_index.unwrap_or_else(|| todo!());
-                let queue_count = queue_family_props[queue_family_index].queue_count as usize;
-
-                let (min_queue_count, max_queue_count) = {
-                    let range = props.graphics_queues.unwrap_or(1..queue_count + 1);
-                    (range.start, range.end)
-                };
-
-                if min_queue_count > queue_count {
-                    return Err(Error::NotSupported);
-                }
-
-                graphics_queue_priorities = vec![1.0; queue_count.min(max_queue_count)];
-
-                queue_create_infos.push(
-                    DeviceQueueCreateInfo::builder()
-                        .queue_family_index(queue_family_index as _)
-                        .queue_priorities(&queue_priorities),
-                );
-            }
-
-            queue_create_infos
+        let enabled_extension_names = {
+            let mut names = Vec::from(Adapter::REQUIRED_EXTENSION_NAMES.map(|name| name.as_ptr()));
+            names.push(khr::Swapchain::name().as_ptr());
+            names
         };
 
-        let mut enabled_extension_names =
-            Vec::from(Adapter::REQUIRED_EXTENSION_NAMES.map(|name| name.as_ptr()));
-
-        enabled_extension_names.push(khr::Swapchain::name().as_ptr());
-
         let create_info = vk::DeviceCreateInfo::builder()
-            .queue_create_infos(&[])
+            .queue_create_infos(&queue_create_infos)
+            .enabled_layer_names(&enabled_layer_names)
             .enabled_extension_names(&enabled_extension_names);
 
         let device = unsafe { instance.create_device(physical_device, &create_info, None)? };
 
         Ok(Device(Arc::new(DeviceShared {
             device,
+            physical_device,
+            queue_family_indices,
             _instance: Arc::clone(&self.0),
         })))
+    }
+
+    pub fn new_swapchain(&self, device: &Device, surface: Surface) -> Result<Swapchain> {
+        use vk::{
+            ColorSpaceKHR, CompositeAlphaFlagsKHR, Format, ImageUsageFlags, PresentModeKHR,
+            SharingMode, SurfaceTransformFlagsKHR, SwapchainCreateFlagsKHR, SwapchainCreateInfoKHR,
+            SwapchainKHR,
+        };
+
+        let surface_capabilities = unsafe {
+            surface.extension.get_physical_device_surface_capabilities(
+                device.0.physical_device,
+                *surface.raw(),
+            )?
+        };
+
+        let _surface_formats = unsafe {
+            surface
+                .extension
+                .get_physical_device_surface_formats(device.0.physical_device, *surface.raw())?
+        };
+
+        let image_format = Format::B8G8R8A8_UNORM;
+        let image_extent = surface_capabilities.current_extent;
+
+        let present_mode = PresentModeKHR::FIFO;
+
+        let extension = khr::Swapchain::new(self.0.raw(), device.0.raw());
+        let create_info = SwapchainCreateInfoKHR::builder()
+            .flags(SwapchainCreateFlagsKHR::empty())
+            .surface(*surface.raw())
+            .min_image_count(1)
+            .image_format(image_format)
+            .image_color_space(ColorSpaceKHR::SRGB_NONLINEAR)
+            .image_extent(image_extent)
+            .image_array_layers(1)
+            .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(SharingMode::EXCLUSIVE)
+            .queue_family_indices(&[])
+            .pre_transform(SurfaceTransformFlagsKHR::IDENTITY)
+            .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(present_mode)
+            .clipped(false)
+            .old_swapchain(SwapchainKHR::null());
+
+        let swapchain = unsafe { extension.create_swapchain(&create_info, None)? };
+
+        Ok(Swapchain {
+            extension,
+            surface,
+            swapchain,
+            _device: Arc::clone(&device.0),
+            _instance: Arc::clone(&self.0),
+        })
     }
 
     fn find_required_layers(
@@ -274,6 +304,32 @@ impl Instance {
             .filter_map(|physical_device| is_supported(*physical_device).transpose())
             .collect()
     }
+
+    fn setup_queue_create_infos(
+        queue_families: &[vk::QueueFamilyProperties],
+        queue_family_indices: &QueueFamilyIndices,
+    ) -> Result<Vec<vk::DeviceQueueCreateInfo>> {
+        use vk::DeviceQueueCreateInfo;
+
+        const PRIORITIES: [f32; 32] = [1.0; 32];
+
+        let queue_family_indices = Adapter::find_queue_family_indices(&queue_families);
+        let graphics = queue_family_indices.graphics.unwrap_or_else(|| todo!());
+        let compute = queue_family_indices.compute.unwrap_or_else(|| todo!());
+        let transfer = queue_family_indices.transfer.unwrap_or_else(|| todo!());
+
+        let mut create_infos = Vec::with_capacity(3);
+        for i in [graphics, compute, transfer] {
+            let create_info = DeviceQueueCreateInfo::builder()
+                .queue_family_index(i as _)
+                .queue_priorities(&PRIORITIES[0..1])
+                .build();
+
+            create_infos.push(create_info);
+        }
+
+        Ok(create_infos)
+    }
 }
 
 pub struct Surface {
@@ -306,9 +362,9 @@ pub struct Adapter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QueueFamilyIndices {
-    graphics_family_index: Option<usize>,
-    compute_family_index: Option<usize>,
-    transfer_family_index: Option<usize>,
+    graphics: Option<usize>,
+    compute: Option<usize>,
+    transfer: Option<usize>,
 }
 
 impl Adapter {
@@ -409,30 +465,30 @@ impl Adapter {
     fn find_queue_family_indices(props: &[vk::QueueFamilyProperties]) -> QueueFamilyIndices {
         use vk::{QueueFamilyProperties, QueueFlags};
 
-        let mut graphics_family_index = None;
-        let mut compute_family_index = None;
-        let mut transfer_family_index = None;
-        for (family_index, QueueFamilyProperties { queue_flags, .. }) in props.iter().enumerate() {
+        let mut graphics = None;
+        let mut compute = None;
+        let mut transfer = None;
+        for (i, QueueFamilyProperties { queue_flags, .. }) in props.iter().enumerate() {
             if queue_flags.contains(QueueFlags::GRAPHICS | QueueFlags::COMPUTE) {
-                graphics_family_index = Some(family_index);
+                graphics = Some(i);
                 continue;
             }
 
             if queue_flags.contains(QueueFlags::COMPUTE) {
-                compute_family_index = Some(family_index);
+                compute = Some(i);
                 continue;
             }
 
             if queue_flags.contains(QueueFlags::TRANSFER) {
-                transfer_family_index = Some(family_index);
+                transfer = Some(i);
                 continue;
             }
         }
 
         QueueFamilyIndices {
-            graphics_family_index,
-            compute_family_index,
-            transfer_family_index,
+            graphics,
+            compute,
+            transfer,
         }
     }
 }
@@ -454,7 +510,220 @@ impl<'a> AsRef<DeviceProps<'a>> for DeviceProps<'a> {
 
 struct DeviceShared {
     device: ash::Device,
+    physical_device: vk::PhysicalDevice,
+    queue_family_indices: QueueFamilyIndices,
     _instance: Arc<InstanceShared>,
 }
 
+impl DeviceShared {
+    fn raw(&self) -> &ash::Device {
+        &self.device
+    }
+}
+
+impl Drop for DeviceShared {
+    fn drop(&mut self) {
+        unsafe { self.device.destroy_device(None) };
+    }
+}
+
 pub struct Device(Arc<DeviceShared>);
+
+impl Device {
+    pub fn queue(&self, operations: Operations) -> Option<DQueue> {
+        let queue_family_indices = self.0.queue_family_indices;
+        let family_index = match operations {
+            Operations::Graphics => queue_family_indices.graphics.unwrap(),
+            Operations::Compute => queue_family_indices.compute.unwrap(),
+            Operations::Transfer => queue_family_indices.transfer.unwrap(),
+        };
+
+        let queue = unsafe { self.0.raw().get_device_queue(family_index as _, 0) };
+
+        Some(DQueue(Arc::new(DQueueShared {
+            queue,
+            family_index,
+            operations,
+            _device: Arc::clone(&self.0),
+        })))
+    }
+
+    pub fn new_command_pool(&self, queue: &DQueue) -> Result<DCommandPool> {
+        use vk::{CommandPoolCreateFlags, CommandPoolCreateInfo};
+
+        let create_info = CommandPoolCreateInfo::builder()
+            .flags(CommandPoolCreateFlags::empty())
+            .queue_family_index(queue.0.family_index as _);
+
+        let pool = unsafe { self.0.raw().create_command_pool(&create_info, None)? };
+
+        Ok(DCommandPool(Arc::new(DCommandPoolShared {
+            pool,
+            _queue: Arc::clone(&queue.0),
+        })))
+    }
+
+    pub fn new_command_list(&self, pool: &mut DCommandPool) -> Result<DCommandList> {
+        use vk::{CommandBufferAllocateInfo, CommandBufferLevel};
+
+        let create_info = CommandBufferAllocateInfo::builder()
+            .command_pool(*pool.0.raw())
+            .level(CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let buffer = unsafe { self.0.raw().allocate_command_buffers(&create_info)? }[0];
+
+        Ok(DCommandList {
+            buffer,
+            state: State::Initial,
+            _pool: Arc::clone(&pool.0),
+        })
+    }
+}
+
+pub struct Swapchain {
+    extension: khr::Swapchain,
+    swapchain: vk::SwapchainKHR,
+    surface: Surface,
+    _device: Arc<DeviceShared>,
+    _instance: Arc<InstanceShared>,
+}
+
+impl Swapchain {
+    pub fn present(&self, queue: &DQueue) -> Result<()> {
+        // unsafe { self.extension.queue_present(*queue.0.raw(), present_info)
+        // };
+
+        todo!()
+    }
+
+    fn raw(&self) -> &vk::SwapchainKHR {
+        &self.swapchain
+    }
+}
+
+impl Drop for Swapchain {
+    fn drop(&mut self) {
+        unsafe { self.extension.destroy_swapchain(self.swapchain, None) };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operations {
+    Graphics,
+    Compute,
+    Transfer,
+}
+
+struct DQueueShared {
+    queue: vk::Queue,
+    family_index: usize,
+    operations: Operations,
+    _device: Arc<DeviceShared>,
+}
+
+impl DQueueShared {
+    fn raw(&self) -> &vk::Queue {
+        &self.queue
+    }
+}
+
+pub struct DQueue(Arc<DQueueShared>);
+
+impl DQueue {
+    pub fn operations(&self) -> Operations {
+        self.0.operations
+    }
+}
+
+struct DCommandPoolShared {
+    pool: vk::CommandPool,
+    _queue: Arc<DQueueShared>,
+}
+
+impl DCommandPoolShared {
+    fn raw(&self) -> &vk::CommandPool {
+        &self.pool
+    }
+}
+
+impl Drop for DCommandPoolShared {
+    fn drop(&mut self) {
+        let device = self._queue._device.raw();
+        unsafe { device.destroy_command_pool(*self.raw(), None) };
+    }
+}
+
+pub struct DCommandPool(Arc<DCommandPoolShared>);
+
+impl DCommandPool {
+    pub fn operations(&self) -> Operations {
+        self.0._queue.operations
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Initial,
+    Recording,
+    Executable,
+}
+
+pub struct DCommandList {
+    buffer: vk::CommandBuffer,
+    state: State,
+    _pool: Arc<DCommandPoolShared>,
+}
+
+impl DCommandList {
+    pub fn operations(&self) -> Operations {
+        self._pool._queue.operations
+    }
+
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// Begins recording for this command list.
+    ///
+    /// # Panics
+    ///
+    /// # Safety
+    pub unsafe fn begin_unchecked(&mut self, pool: &DCommandPool) -> Result<()> {
+        use vk::{CommandBufferBeginInfo, CommandBufferInheritanceInfo, CommandBufferUsageFlags};
+
+        let inheritance_info = CommandBufferInheritanceInfo::builder();
+
+        let begin_info = CommandBufferBeginInfo::builder()
+            .flags(CommandBufferUsageFlags::empty())
+            .inheritance_info(&inheritance_info);
+
+        self.device()
+            .begin_command_buffer(*self.raw(), &begin_info)
+            .map_err(Into::into)
+    }
+
+    /// Begins recording for this command list.
+    ///
+    /// # Safety
+    pub unsafe fn end_unchecked(&mut self) -> Result<()> {
+        self.device()
+            .end_command_buffer(*self.raw())
+            .map_err(Into::into)
+    }
+
+    fn raw(&self) -> &vk::CommandBuffer {
+        &self.buffer
+    }
+
+    fn device(&self) -> &ash::Device {
+        self._pool._queue._device.raw()
+    }
+}
+
+impl Drop for DCommandList {
+    fn drop(&mut self) {
+        let device = self._pool._queue._device.raw();
+        unsafe { device.free_command_buffers(*self._pool.raw(), &[self.buffer]) };
+    }
+}
