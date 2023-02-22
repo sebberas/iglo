@@ -41,6 +41,7 @@ pub mod dx12;
 pub mod vulkan;
 
 pub mod spirv;
+pub mod sync;
 
 mod macros {
     macro_rules! impl_into_rhi {
@@ -126,10 +127,9 @@ pub enum Error {
     Unknown,
 
     DeviceLost,
+    SurfaceLost,
 
     Other(Cow<'static, String>),
-
-    BackendMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -148,9 +148,13 @@ impl Instance {
         }
     }
 
-    ///
+    /// Creates a new surface
     ///
     /// # Safety
+    ///
+    /// `window` must not be destroyed while the surface or swapchain exists. If
+    /// the window is destroyed any function can fail with
+    /// [`Error::SurfaceLost`]
     pub unsafe fn new_surface(&self, window: *const Window) -> Result<Surface> {
         match self {
             Self::DX12(instance) => instance.new_surface(window).map(Surface::DX12),
@@ -158,6 +162,8 @@ impl Instance {
     }
 
     /// Creates a new device
+    ///
+    /// The device is the primary interface for interacting with the GPU.
     pub fn new_device(&self, props: &DeviceProps) -> Result<Device> {
         match self {
             Self::DX12(i) => {
@@ -167,11 +173,13 @@ impl Instance {
         }
     }
 
-    /// Creates a new swapchain with specified format
+    /// Creates a new swapchain with the specified format
     ///
     /// # Panics
     ///
-    /// Panics if the format is [`Unknown`]
+    /// - Panics if the format is [`Format::Unknown`]
+    /// - Panics if [`SwapchainProps::width`] or [`SwapchainProps::height`] are
+    /// larger than the size allowed by the API.
     pub fn new_swapchain<'a, F>(
         &self,
         props: impl Into<SwapchainProps<'a, F>>,
@@ -310,9 +318,9 @@ impl Device {
     /// - Panics if the memory in `create_info` is incompatible with the
     /// type of image being created.
     ///
-    /// - Panics if `ImageProps::width` or `ImageProps::height` are
+    /// - Panics if [`ImageProps::width`] or [`ImageProps::height`] are
     /// larger than the size allowed by the API. These constraints should be
-    /// queried at runtime.
+    /// queried at runtime using [`Device::limits`].
     ///
     /// - Panics if the image is being created with an unknown format.
     ///

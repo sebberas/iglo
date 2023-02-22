@@ -42,16 +42,24 @@ impl Window {
     }
 
     #[inline]
-    pub fn poll_events(&self) -> () {
+    pub fn poll_events(&self) -> impl Iterator<Item = &Event> {
         self.0.poll_events();
+        [].into_iter()
     }
 
     #[inline]
-    pub fn wait_events(&self) -> () {
+    pub fn wait_events(&self) -> impl Iterator<Item = &Event> {
         self.0.wait_events();
+        [].into_iter()
     }
 
     pub fn should_close(&self) -> bool {
         self.0.should_close()
     }
 }
+
+enum Event {}
+
+pub struct SaveFileDialog(imp::SaveFileDialog);
+
+pub struct OpenFileDialog(imp::OpenFileDialog);
