@@ -59,12 +59,12 @@ mod macros {
     macro_rules! impl_try_from_rhi {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
             impl $(<$($arg $(: $bound)?),*>)? TryFrom <$crate::rhi::$type$(<$($arg),*>)?> for $type$(<$($arg),*>)? {
-                type Error = $crate::rhi::Error;
+                type Error = $crate::rhi::BackendError;
 
-                fn try_from(o: $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                fn try_from(o: $crate::rhi::$type$(<$($arg),*>)?) -> std::result::Result<Self, Self::Error> {
                     match o {
                         $crate::rhi::$type::$match(o) => Ok(o),
-                        _ => Err(Self::Error::BackendMismatch),
+                        _ => Err(Self::Error::Mismatch),
                     }
                 }
             }
@@ -74,12 +74,12 @@ mod macros {
     macro_rules! impl_try_from_rhi_ref {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
             impl <'a, $($($arg $(: $bound)?),*)?> TryFrom <&'a $crate::rhi::$type$(<$($arg),*>)?> for &'a $type$(<$($arg),*>)? {
-                type Error = $crate::rhi::Error;
+                type Error = $crate::rhi::BackendError;
 
-                fn try_from(o: &'a $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                fn try_from(o: &'a $crate::rhi::$type$(<$($arg),*>)?) -> std::result::Result<Self, Self::Error> {
                     match o {
                         $crate::rhi::$type::$match(o) => Ok(o),
-                        _ => Err(Self::Error::BackendMismatch),
+                        _ => Err(Self::Error::Mismatch),
                     }
                 }
             }
@@ -89,12 +89,12 @@ mod macros {
     macro_rules! impl_try_from_rhi_mut {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
             impl <'a, $($($arg $(: $bound)?),*)?> TryFrom <&'a mut $crate::rhi::$type$(<$($arg),*>)?> for &'a mut $type$(<$($arg),*>)? {
-                type Error = $crate::rhi::Error;
+                type Error = $crate::rhi::BackendError;
 
-                fn try_from(o: &'a mut $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                fn try_from(o: &'a mut $crate::rhi::$type$(<$($arg),*>)?) -> std::result::Result<Self, Self::Error> {
                     match o {
                         $crate::rhi::$type::$match(o) => Ok(o),
-                        _ => Err(Self::Error::BackendMismatch),
+                        _ => Err(Self::Error::Mismatch),
                     }
                 }
             }
@@ -135,7 +135,11 @@ pub enum Error {
     SurfaceOutdated,
 
     Other(Cow<'static, String>),
-    BackendMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendError {
+    Mismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -154,9 +158,13 @@ impl Instance {
         }
     }
 
-    ///
+    /// Creates a new surface
     ///
     /// # Safety
+    ///
+    /// `window` must not be destroyed while the surface or swapchain exists. If
+    /// the window is destroyed any function can fail with
+    /// [`Error::SurfaceLost`]
     pub unsafe fn new_surface(&self, window: *const Window) -> Result<Surface> {
         match self {
             Self::DX12(instance) => instance.new_surface(window).map(Surface::DX12),
@@ -164,20 +172,24 @@ impl Instance {
     }
 
     /// Creates a new device
+    ///
+    /// The device is the primary interface for interacting with the GPU.
     pub fn new_device(&self, props: &DeviceProps) -> Result<Device> {
         match self {
             Self::DX12(i) => {
                 let surface = props.surface.map(TryInto::try_into).transpose();
-                i.new_device(surface?, props).map(Device::DX12)
+                i.new_device(surface.unwrap(), props).map(Device::DX12)
             }
         }
     }
 
-    /// Creates a new swapchain with specified format
+    /// Creates a new swapchain with the specified format
     ///
     /// # Panics
     ///
-    /// Panics if the format is [`Unknown`]
+    /// - Panics if the format is [`Format::Unknown`]
+    /// - Panics if [`SwapchainProps::width`] or [`SwapchainProps::height`] are
+    /// larger than the size allowed by the API.
     pub fn new_swapchain<'a, P, F>(&self, props: P) -> Result<Swapchain<F>>
     where
         P: Into<SwapchainProps<'a, F>>,
@@ -187,7 +199,8 @@ impl Instance {
         match self {
             Self::DX12(i) => {
                 let (device, surface) = (props.device.try_into(), props.surface.try_into());
-                i.new_swapchain(device?, surface?).map(Swapchain::DX12)
+                i.new_swapchain(device.unwrap(), surface.unwrap())
+                    .map(Swapchain::DX12)
             }
         }
     }
@@ -258,8 +271,8 @@ impl Device {
     {
         match self {
             Self::DX12(d) => {
-                let queue = queue.try_into()?;
-                d.new_command_pool(queue).map(CommandPool::DX12)
+                let queue = queue.try_into();
+                d.new_command_pool(queue.unwrap()).map(CommandPool::DX12)
             }
         }
     }
@@ -279,8 +292,8 @@ impl Device {
     {
         match self {
             Self::DX12(d) => {
-                let pool = pool.try_into()?;
-                d.new_command_list(pool).map(CommandList::DX12)
+                let pool = pool.try_into();
+                d.new_command_list(pool.unwrap()).map(CommandList::DX12)
             }
         }
     }
@@ -314,9 +327,9 @@ impl Device {
     /// - Panics if the memory in `create_info` is incompatible with the
     /// type of image being created.
     ///
-    /// - Panics if `ImageProps::width` or `ImageProps::height` are
+    /// - Panics if [`ImageProps::width`] or [`ImageProps::height`] are
     /// larger than the size allowed by the API. These constraints should be
-    /// queried at runtime.
+    /// queried at runtime using [`Device::limits`].
     ///
     /// - Panics if the image is being created with an unknown format.
     ///

@@ -34,24 +34,29 @@ impl WindowData {
         match msg {
             WM_NCCREATE => {
                 // SAFETY:
-                // The Win32 API states that when the msg is WM_NCCREATE, lp is a pointer to a
-                // non-null CREATESTRUCTW struct.
+                // The windows documentation states that when the msg is WM_NCCREATE, lp is a
+                // pointer to a valid CREATESTRUCTW struct.
                 let CREATESTRUCTW { lpCreateParams, .. } =
                     unsafe { std::mem::transmute::<_, &CREATESTRUCTW>(lp) };
 
                 // SAFETY:
                 // - We know data is non-null because we supply it when calling CreateWindowExW.
-                // - The object is destroyed when the window is dropped because of Box's
-                //   semantics.
+                // - The object is destroyed when the window is dropped because the allocation
+                //   is managed by a box.
                 let data: *mut Self = unsafe { std::mem::transmute(*lpCreateParams) };
 
-                // SAFETY
+                // SAFETY:
+                // - `data` is valid for the entire lifetime since it is tied to the life of the
+                //   window.
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as *const _ as isize) };
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, Self::wndproc_proxy as isize) };
 
-                // SAFETY
+                // SAFETY:
+                // - We know that `data` is non-null, because we supply a valid pointer when
+                //   calling CreateWindowExW during the creation of the window.
                 unsafe { &mut (*data) }.wndproc(hwnd, msg, wp, lp)
             }
+            // SAFETY:
             _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
         }
     }
@@ -171,3 +176,7 @@ impl WindowExt for os::Window {
         platform.0.hinstance
     }
 }
+
+pub struct SaveFileDialog {}
+
+pub struct OpenFileDialog {}
