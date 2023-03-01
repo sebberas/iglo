@@ -58,7 +58,7 @@ impl Window {
     }
 }
 
-enum Event {}
+pub enum Event {}
 
 pub struct SaveFileDialog(imp::SaveFileDialog);
 

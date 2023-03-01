@@ -31,17 +31,19 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use self::format::{Format, FormatType};
+pub use self::format::Format;
+use self::format::FormatType;
 use self::queue::{Graphics, QueueKind};
 use self::state::{Initial, Recording, State};
 use self::usage::{BufferUsage, ImageUsage};
 use crate::os::Window;
 
+pub mod sync;
+
 pub mod dx12;
 pub mod vulkan;
 
 pub mod spirv;
-pub mod sync;
 
 mod macros {
     macro_rules! impl_into_rhi {
@@ -57,12 +59,12 @@ mod macros {
     macro_rules! impl_try_from_rhi {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
             impl $(<$($arg $(: $bound)?),*>)? TryFrom <$crate::rhi::$type$(<$($arg),*>)?> for $type$(<$($arg),*>)? {
-                type Error = $crate::rhi::Error;
+                type Error = $crate::rhi::BackendError;
 
-                fn try_from(o: $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                fn try_from(o: $crate::rhi::$type$(<$($arg),*>)?) -> std::result::Result<Self, Self::Error> {
                     match o {
                         $crate::rhi::$type::$match(o) => Ok(o),
-                        _ => Err(Self::Error::BackendMismatch),
+                        _ => Err(Self::Error::Mismatch),
                     }
                 }
             }
@@ -72,12 +74,12 @@ mod macros {
     macro_rules! impl_try_from_rhi_ref {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
             impl <'a, $($($arg $(: $bound)?),*)?> TryFrom <&'a $crate::rhi::$type$(<$($arg),*>)?> for &'a $type$(<$($arg),*>)? {
-                type Error = $crate::rhi::Error;
+                type Error = $crate::rhi::BackendError;
 
-                fn try_from(o: &'a $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                fn try_from(o: &'a $crate::rhi::$type$(<$($arg),*>)?) -> std::result::Result<Self, Self::Error> {
                     match o {
                         $crate::rhi::$type::$match(o) => Ok(o),
-                        _ => Err(Self::Error::BackendMismatch),
+                        _ => Err(Self::Error::Mismatch),
                     }
                 }
             }
@@ -87,12 +89,12 @@ mod macros {
     macro_rules! impl_try_from_rhi_mut {
         ($match:ident, $type:ident $(<$($arg:ident $(: $bound:ident)?),*>)?) => {
             impl <'a, $($($arg $(: $bound)?),*)?> TryFrom <&'a mut $crate::rhi::$type$(<$($arg),*>)?> for &'a mut $type$(<$($arg),*>)? {
-                type Error = $crate::rhi::Error;
+                type Error = $crate::rhi::BackendError;
 
-                fn try_from(o: &'a mut $crate::rhi::$type$(<$($arg),*>)?) -> $crate::rhi::Result<Self> {
+                fn try_from(o: &'a mut $crate::rhi::$type$(<$($arg),*>)?) -> std::result::Result<Self, Self::Error> {
                     match o {
                         $crate::rhi::$type::$match(o) => Ok(o),
-                        _ => Err(Self::Error::BackendMismatch),
+                        _ => Err(Self::Error::Mismatch),
                     }
                 }
             }
@@ -127,9 +129,17 @@ pub enum Error {
     Unknown,
 
     DeviceLost,
+    Timeout,
+
     SurfaceLost,
+    SurfaceOutdated,
 
     Other(Cow<'static, String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendError {
+    Mismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -168,7 +178,7 @@ impl Instance {
         match self {
             Self::DX12(i) => {
                 let surface = props.surface.map(TryInto::try_into).transpose();
-                i.new_device(surface?, props).map(Device::DX12)
+                i.new_device(surface.unwrap(), props).map(Device::DX12)
             }
         }
     }
@@ -180,18 +190,17 @@ impl Instance {
     /// - Panics if the format is [`Format::Unknown`]
     /// - Panics if [`SwapchainProps::width`] or [`SwapchainProps::height`] are
     /// larger than the size allowed by the API.
-    pub fn new_swapchain<'a, F>(
-        &self,
-        props: impl Into<SwapchainProps<'a, F>>,
-    ) -> Result<Swapchain<F>>
+    pub fn new_swapchain<'a, P, F>(&self, props: P) -> Result<Swapchain<F>>
     where
-        F: Format,
+        P: Into<SwapchainProps<'a, F>>,
+        F: FormatType,
     {
         let props = props.into();
         match self {
             Self::DX12(i) => {
                 let (device, surface) = (props.device.try_into(), props.surface.try_into());
-                i.new_swapchain(device?, surface?).map(Swapchain::DX12)
+                i.new_swapchain(device.unwrap(), surface.unwrap())
+                    .map(Swapchain::DX12)
             }
         }
     }
@@ -262,8 +271,8 @@ impl Device {
     {
         match self {
             Self::DX12(d) => {
-                let queue = queue.try_into()?;
-                d.new_command_pool(queue).map(CommandPool::DX12)
+                let queue = queue.try_into();
+                d.new_command_pool(queue.unwrap()).map(CommandPool::DX12)
             }
         }
     }
@@ -283,8 +292,8 @@ impl Device {
     {
         match self {
             Self::DX12(d) => {
-                let pool = pool.try_into()?;
-                d.new_command_list(pool).map(CommandList::DX12)
+                let pool = pool.try_into();
+                d.new_command_list(pool.unwrap()).map(CommandList::DX12)
             }
         }
     }
@@ -330,7 +339,7 @@ impl Device {
     /// is successfull. Otherwise it returns an error.
     pub fn new_image<F, U>(&self, props: &mut impl AsMut<ImageProps<F, U>>) -> Result<Image<F, U>>
     where
-        F: Format,
+        F: FormatType,
         U: ImageUsage,
     {
         match self {
@@ -339,7 +348,7 @@ impl Device {
     }
 }
 
-pub struct SwapchainProps<'a, F: Format> {
+pub struct SwapchainProps<'a, F: FormatType> {
     pub device: &'a Device,
     pub surface: Surface,
     pub width: Option<NonZeroUsize>,
@@ -348,7 +357,7 @@ pub struct SwapchainProps<'a, F: Format> {
     pub format: F,
 }
 
-impl<'a, F: Format> SwapchainProps<'a, F> {
+impl<'a, F: FormatType> SwapchainProps<'a, F> {
     pub fn new(device: &'a Device, surface: Surface, format: F) -> Self {
         Self {
             device,
@@ -367,15 +376,15 @@ impl<'a> SwapchainProps<'a, format::Unknown> {
     }
 }
 
-impl<'a, F: Format> AsRef<SwapchainProps<'a, F>> for SwapchainProps<'a, F> {
+impl<'a, F: FormatType> AsRef<SwapchainProps<'a, F>> for SwapchainProps<'a, F> {
     fn as_ref(&self) -> &SwapchainProps<'a, F> {
         self
     }
 }
 
-pub struct SwapchainPropsBuilder<'a, F: Format>(SwapchainProps<'a, F>);
+pub struct SwapchainPropsBuilder<'a, F: FormatType>(SwapchainProps<'a, F>);
 
-impl<'a, F: Format> SwapchainPropsBuilder<'a, F> {
+impl<'a, F: FormatType> SwapchainPropsBuilder<'a, F> {
     pub fn width(mut self, width: NonZeroUsize) -> Self {
         self.0.width = Some(width);
         self
@@ -391,7 +400,7 @@ impl<'a, F: Format> SwapchainPropsBuilder<'a, F> {
         self
     }
 
-    pub fn format<F2: Format>(self, format: F2) -> SwapchainPropsBuilder<'a, F2> {
+    pub fn format<F2: FormatType>(self, format: F2) -> SwapchainPropsBuilder<'a, F2> {
         SwapchainPropsBuilder(SwapchainProps {
             device: self.0.device,
             surface: self.0.surface,
@@ -407,7 +416,7 @@ impl<'a, F: Format> SwapchainPropsBuilder<'a, F> {
     }
 }
 
-impl<'a, F: Format> AsRef<SwapchainProps<'a, F>> for SwapchainPropsBuilder<'a, F> {
+impl<'a, F: FormatType> AsRef<SwapchainProps<'a, F>> for SwapchainPropsBuilder<'a, F> {
     fn as_ref(&self) -> &SwapchainProps<'a, F> {
         &self.0
     }
@@ -419,11 +428,11 @@ pub enum Fullscreen {
     Windowed,
 }
 
-pub enum Swapchain<F: Format> {
+pub enum Swapchain<F: FormatType> {
     DX12(dx12::Swapchain<F>),
 }
 
-impl<F: Format> Swapchain<F> {
+impl<F: FormatType> Swapchain<F> {
     pub fn set_fullscreen(&mut self, state: Fullscreen) -> Result<()> {
         match self {
             Self::DX12(s) => s.set_fullscreen(state),
@@ -643,7 +652,7 @@ pub type IndexBuffer<T> = Buffer<T, usage::IndexBuffer>;
 
 /// This structure contains all the necessary information for creating an
 /// image.
-pub struct ImageProps<F: Format, U: ImageUsage> {
+pub struct ImageProps<F: FormatType, U: ImageUsage> {
     pub width: NonZeroUsize,
     pub height: NonZeroUsize,
     pub format: F,
@@ -663,15 +672,15 @@ impl ImageProps<format::Unknown, usage::Unknown> {
     }
 }
 
-impl<F: Format, U: ImageUsage> AsMut<Self> for ImageProps<F, U> {
+impl<F: FormatType, U: ImageUsage> AsMut<Self> for ImageProps<F, U> {
     fn as_mut(&mut self) -> &mut Self {
         self
     }
 }
 
-pub struct ImagePropsBuilder<F: Format, U: ImageUsage>(ImageProps<F, U>);
+pub struct ImagePropsBuilder<F: FormatType, U: ImageUsage>(ImageProps<F, U>);
 
-impl<F: Format, U: ImageUsage> ImagePropsBuilder<F, U> {
+impl<F: FormatType, U: ImageUsage> ImagePropsBuilder<F, U> {
     pub fn width(mut self, width: NonZeroUsize) -> Self {
         self.0.width = width;
         self
@@ -682,7 +691,7 @@ impl<F: Format, U: ImageUsage> ImagePropsBuilder<F, U> {
         self
     }
 
-    pub fn format<F2: Format>(self, format: F2) -> ImagePropsBuilder<F2, U> {
+    pub fn format<F2: FormatType>(self, format: F2) -> ImagePropsBuilder<F2, U> {
         ImagePropsBuilder(ImageProps {
             width: self.0.width,
             height: self.0.height,
@@ -707,17 +716,17 @@ impl<F: Format, U: ImageUsage> ImagePropsBuilder<F, U> {
     }
 }
 
-impl<F: Format, U: ImageUsage> AsMut<ImageProps<F, U>> for ImagePropsBuilder<F, U> {
+impl<F: FormatType, U: ImageUsage> AsMut<ImageProps<F, U>> for ImagePropsBuilder<F, U> {
     fn as_mut(&mut self) -> &mut ImageProps<F, U> {
         &mut self.0
     }
 }
 
-pub enum Image<F: Format, U: ImageUsage> {
+pub enum Image<F: FormatType, U: ImageUsage> {
     DX12(dx12::Image<F, U>),
 }
 
-pub enum ImageView<'a, F: Format> {
+pub enum ImageView<'a, F: FormatType> {
     DX12(dx12::ImageView<'a, F>),
 }
 
@@ -775,14 +784,15 @@ pub mod usage {
 pub mod format {
     macro_rules! generate_formats {
         ($vis:vis enum $enum:ident { $($inner:ident,)* }) => {
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             $vis enum $enum {
                 $($inner,)*
             }
 
             $(
                 $vis struct $inner;
-                impl Format for $inner {
-                    const FORMAT_TYPE: $enum = $enum::$inner;
+                impl FormatType for $inner {
+                    const FORMAT: $enum = $enum::$inner;
                 }
             )*
 
@@ -790,12 +800,12 @@ pub mod format {
     }
 
     // TODO: Make this trait sealed.
-    pub trait Format {
-        const FORMAT_TYPE: FormatType;
+    pub trait FormatType {
+        const FORMAT: Format;
     }
 
     generate_formats! {
-        pub enum FormatType {
+        pub enum Format {
             Unknown,
 
             R8,

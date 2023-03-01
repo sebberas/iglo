@@ -210,7 +210,7 @@ impl Instance {
 
     pub fn new_swapchain<F>(&self, device: &Device, surface: Surface) -> Result<Swapchain<F>>
     where
-        F: Format,
+        F: FormatType,
     {
         let InstanceShared { factory, .. } = &*self.0;
         let DeviceShared { present, .. } = &*device.0;
@@ -219,9 +219,9 @@ impl Instance {
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: 0,
             Height: 0,
-            Format: match F::FORMAT_TYPE {
-                FormatType::Unknown => panic!("Unable to create swapchain with an unknown format"),
-                FormatType::R8G8B8A8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM,
+            Format: match F::FORMAT {
+                Format::Unknown => panic!("Unable to create swapchain with an unknown format"),
+                Format::R8G8B8A8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM,
                 format => format.into(),
             },
             Stereo: false.into(),
@@ -383,7 +383,7 @@ impl Device {
 
     pub fn new_image<F, U>(&self, info: &mut ImageProps<F, U>) -> Result<Image<F, U>>
     where
-        F: Format,
+        F: FormatType,
         U: ImageUsage,
     {
         let DeviceShared { device, .. } = &*self.0;
@@ -404,7 +404,7 @@ impl Device {
                 Height: info.height.get() as u32,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
-                Format: F::FORMAT_TYPE.into(),
+                Format: F::FORMAT.into(),
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -445,7 +445,7 @@ unsafe impl Sync for Device {}
 
 impl_try_from_rhi_all!(DX12, Device);
 
-struct SwapchainShared<F: Format> {
+struct SwapchainShared<F: FormatType> {
     handle: IDXGISwapChain4,
     present: ID3D12CommandQueue,
     backbuffers: u32,
@@ -454,9 +454,9 @@ struct SwapchainShared<F: Format> {
     _marker: PhantomData<F>,
 }
 
-pub struct Swapchain<F: Format>(Arc<SwapchainShared<F>>);
+pub struct Swapchain<F: FormatType>(Arc<SwapchainShared<F>>);
 
-impl<F: Format> Swapchain<F> {
+impl<F: FormatType> Swapchain<F> {
     pub fn set_fullscreen(&mut self, state: Fullscreen) -> Result<()> {
         let SwapchainShared { handle, .. } = &*self.0;
 
@@ -558,7 +558,7 @@ impl<'a> CommandList<'a, queue::Graphics, Recording> {
 impl<'a> CommandList<'a, queue::Graphics, Executable> {}
 pub struct RenderPass {}
 
-pub struct RenderTarget<F: Format> {
+pub struct RenderTarget<F: FormatType> {
     image: Image<F, usage::RenderTarget>,
 }
 
@@ -569,18 +569,18 @@ pub struct Buffer<T: BufferLayout, U: BufferUsage> {
 
 impl_try_from_rhi_all!(DX12, Buffer<T: BufferLayout, U: BufferUsage>);
 
-pub struct Image<F: Format, U: ImageUsage> {
+pub struct Image<F: FormatType, U: ImageUsage> {
     resource: ID3D12Resource,
     _marker: PhantomData<(F, U)>,
 }
 
-pub struct ImageView<'a, F: Format> {
+pub struct ImageView<'a, F: FormatType> {
     _marker: PhantomData<(&'a (), F)>,
 }
 
-impl From<FormatType> for DXGI_FORMAT {
-    fn from(value: FormatType) -> Self {
-        use FormatType::*;
+impl From<Format> for DXGI_FORMAT {
+    fn from(value: Format) -> Self {
+        use Format::*;
 
         match value {
             Unknown => DXGI_FORMAT_UNKNOWN,
