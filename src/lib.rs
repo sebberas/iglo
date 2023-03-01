@@ -13,5 +13,6 @@
 
 pub mod core;
 pub mod os;
+pub mod parser;
 pub mod renderer;
 pub mod rhi;
