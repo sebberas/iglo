@@ -1,10 +1,15 @@
 use std::ffi::*;
 use std::ops::{Range, RangeInclusive};
 use std::sync::*;
+use std::time::Duration;
 
 use ash::extensions::*;
 use ash::{vk, Entry};
 use glam::UVec2;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::*;
+use windows::Win32::System::Threading::*;
+use windows::Win32::System::WindowsProgramming::*;
 
 use crate::rhi::macros::*;
 use crate::rhi::*;
@@ -31,6 +36,8 @@ impl From<vk::Result> for Error {
     }
 }
 
+type Result<T> = std::result::Result<T, Error>;
+
 const VALIDATION_LAYER_NAME: &CStr =
     unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") };
 
@@ -50,9 +57,6 @@ pub struct Instance(Arc<InstanceShared>);
 
 impl Instance {
     const ENGINE_NAME: &'static CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"iglo\0") };
-
-    const REQUIRED_DEVICE_LAYER_NAMES: [&'static CStr; 0] = [];
-    const REQUIRED_DEVICE_EXTENSION_NAMES: [&'static CStr; 0] = [];
 
     pub fn new(debug: bool) -> Result<Self> {
         let entry = Entry::linked();
@@ -87,7 +91,7 @@ impl Instance {
         })))
     }
 
-    pub unsafe fn new_surface(&self, window: *const Window) -> Result<Surface> {
+    pub fn new_surface(&self, window: &Window) -> Result<Surface> {
         use crate::os::windows::WindowExt;
 
         let win32_extension = khr::Win32Surface::new(&self.0.entry, &self.0.instance);
@@ -97,7 +101,7 @@ impl Instance {
             .hinstance(unsafe { &*window }.hinstance().0 as *const _)
             .hwnd(unsafe { &*window }.hwnd().0 as *const _);
 
-        let surface = win32_extension.create_win32_surface(&create_info, None)?;
+        let surface = unsafe { win32_extension.create_win32_surface(&create_info, None)? };
         let extension = khr::Surface::new(&self.0.entry, &self.0.instance);
 
         Ok(Surface {
@@ -230,14 +234,14 @@ impl Instance {
     ) -> Option<impl Iterator<Item = &vk::LayerProperties>> {
         let found_layers = props.iter().filter(|props| {
             let layer_name = unsafe { CStr::from_ptr(props.layer_name.as_ptr()) };
-            Self::REQUIRED_DEVICE_LAYER_NAMES.contains(&layer_name)
+            Adapter::REQUIRED_LAYER_NAMES.contains(&layer_name)
         });
 
         let found_layer_names = found_layers
             .clone()
             .map(|props| unsafe { CStr::from_ptr(props.layer_name.as_ptr()) });
 
-        let has_required_layers = Self::REQUIRED_DEVICE_LAYER_NAMES
+        let has_required_layers = Adapter::REQUIRED_LAYER_NAMES
             .iter()
             .all(|&required| found_layer_names.clone().any(|found| found == required));
 
@@ -249,14 +253,14 @@ impl Instance {
     ) -> Option<impl Iterator<Item = &vk::ExtensionProperties>> {
         let found_extensions = props.iter().filter(|props| {
             let extension_name = unsafe { CStr::from_ptr(props.extension_name.as_ptr()) };
-            Self::REQUIRED_DEVICE_EXTENSION_NAMES.contains(&extension_name)
+            Adapter::REQUIRED_EXTENSION_NAMES.contains(&extension_name)
         });
 
         let found_extension_names = found_extensions
             .clone()
             .map(|props| unsafe { CStr::from_ptr(props.extension_name.as_ptr()) });
 
-        let has_required_extensions = Self::REQUIRED_DEVICE_EXTENSION_NAMES
+        let has_required_extensions = Adapter::REQUIRED_EXTENSION_NAMES
             .iter()
             .all(|&required| found_extension_names.clone().any(|found| found == required));
 
@@ -357,8 +361,8 @@ impl Drop for Surface {
     }
 }
 
-impl_try_from_rhi_all!(Vulkan, Surface);
-impl_into_rhi!(Vulkan, Surface);
+// impl_try_from_rhi_all!(Vulkan, Surface);
+// impl_into_rhi!(Vulkan, Surface);
 
 #[derive(Clone)]
 pub struct Adapter {
@@ -375,7 +379,18 @@ struct QueueFamilyIndices {
 
 impl Adapter {
     const REQUIRED_LAYER_NAMES: [&'static CStr; 0] = [];
-    const REQUIRED_EXTENSION_NAMES: [&'static CStr; 0] = [];
+
+    #[cfg(target_os = "windows")]
+    const REQUIRED_EXTENSION_NAMES: [&'static CStr; 2] = [
+        khr::ExternalFenceWin32::name(),
+        khr::ExternalSemaphoreWin32::name(),
+    ];
+
+    #[cfg(target_os = "linux")]
+    const REQUIRED_EXTENSION_NAMES: [&'static CStr; 2] = [
+        khr::ExternalFenceFd::name(),
+        khr::ExternalSemaphoreFd::name(),
+    ];
 
     /// Returns whether this adapter supports presenting to the passed surface
     pub fn is_surface_supported(&self, surface: &Surface) -> Result<bool> {
@@ -916,13 +931,6 @@ impl Drop for Swapchain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Operations {
-    Graphics,
-    Compute,
-    Transfer,
-}
-
 struct DQueueShared {
     queue: vk::Queue,
     family_index: usize,
@@ -978,6 +986,8 @@ impl DQueue {
         unsafe { device.queue_wait_idle(*self.0.raw()) }.map_err(Into::into)
     }
 }
+
+impl_try_from_rhi_all!(Vulkan, DQueue);
 
 struct DCommandPoolShared {
     pool: vk::CommandPool,
@@ -1388,6 +1398,48 @@ impl Fence {
         unsafe { device.reset_fences(&[*self.raw()]) }.map_err(Into::into)
     }
 
+    pub fn set_callback(&mut self, f: impl Fn() + 'static) {
+        let instance = self._device._instance.raw();
+        let device = self._device.raw();
+
+        #[cfg(target_os = "windows")]
+        {
+            let extension = khr::ExternalFenceWin32::new(instance, device);
+            let get_info = vk::FenceGetWin32HandleInfoKHR::builder()
+                .fence(*self.raw())
+                .handle_type(vk::ExternalFenceHandleTypeFlags::OPAQUE_WIN32);
+
+            let handle = unsafe { extension.get_fence_win32_handle(&get_info) }.unwrap();
+            let handle = HANDLE(handle as _);
+
+            let mut out = HANDLE::default();
+            unsafe {
+                // HACK
+                if RegisterWaitForSingleObject(
+                    &mut out,
+                    handle,
+                    Some(Self::callback_proxy),
+                    None,
+                    INFINITE,
+                    WT_EXECUTEINPERSISTENTTHREAD | WT_EXECUTEONLYONCE,
+                ) == BOOL(0)
+                {
+                    println!("{:?}", unsafe { GetLastError() });
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            todo!()
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    unsafe extern "system" fn callback_proxy(ptr: *mut c_void, _: BOOLEAN) {
+        println!("fired");
+    }
+
     fn raw(&self) -> &vk::Fence {
         &self.fence
     }
@@ -1454,65 +1506,66 @@ impl Drop for DImageView {
 
 impl From<Format> for vk::Format {
     fn from(value: Format) -> Self {
-        match value {
-            Format::Unknown => Self::UNDEFINED,
-            Format::R8 => todo!(),
-            Format::R8Unorm => Self::R8_UNORM,
-            Format::R8Snorm => Self::R8_SNORM,
-            Format::R8Uint => Self::R8_UINT,
-            Format::R8Sint => Self::R8_SINT,
-            Format::R16 => todo!(),
-            Format::R16Unorm => Self::R16_UNORM,
-            Format::R16Snorm => Self::R16_SNORM,
-            Format::R16Uint => Self::R16_UINT,
-            Format::R16Sint => Self::R16_SINT,
-            Format::R16Float => Self::R16_SFLOAT,
-            Format::D16Unorm => Self::D16_UNORM,
-            Format::R32 => todo!(),
-            Format::R32Uint => Self::R32_UINT,
-            Format::R32Sint => Self::R32_SINT,
-            Format::R32Float => Self::R32_SFLOAT,
-            Format::D32Float => Self::D32_SFLOAT,
-            Format::R8G8 => todo!(),
-            Format::R8G8Unorm => Self::R8G8_UNORM,
-            Format::R8G8Snorm => Self::R8G8_SNORM,
-            Format::R8G8Uint => Self::R8G8_UINT,
-            Format::R8G8Sint => Self::R8G8_SINT,
-            Format::R16G16 => todo!(),
-            Format::R16G16Unorm => Self::R16G16_UNORM,
-            Format::R16G16Snorm => Self::R16G16_SNORM,
-            Format::R16G16Uint => Self::R16G16_UINT,
-            Format::R16G16Sint => Self::R16G16_SINT,
-            Format::R16G16Float => Self::R16G16_SFLOAT,
-            Format::D24UnormS8Uint => Self::D24_UNORM_S8_UINT,
-            Format::R32G32 => todo!(),
-            Format::R32G32Uint => Self::R32G32_UINT,
-            Format::R32G32Sint => Self::R32G32_SINT,
-            Format::R32G32Float => Self::R32G32_SFLOAT,
-            Format::R11G11B10Float => todo!(),
-            Format::R32G32B32 => todo!(),
-            Format::R32G32B32Uint => Self::R32G32B32_UINT,
-            Format::R32G32B32Sint => Self::R32G32B32_SINT,
-            Format::R32G32B32Float => Self::R32G32B32_SFLOAT,
-            Format::R8G8B8A8 => todo!(),
-            Format::R8G8B8A8Unorm => Self::R8G8B8A8_UNORM,
-            Format::R8G8B8A8Snorm => Self::R8G8B8A8_SNORM,
-            Format::R8G8B8A8Uint => Self::R8G8B8A8_UINT,
-            Format::R8G8B8A8Sint => Self::R8G8B8A8_SINT,
-            Format::R8G8B8A8Srgb => Self::R8G8B8A8_SRGB,
-            Format::R10G10B10A2 => todo!(),
-            Format::R10G10B10A2Unorm => todo!(),
-            Format::R10G10B10A2Uint => todo!(),
-            Format::R16G16B16A16 => todo!(),
-            Format::R16G16B16A16Unorm => Self::R16G16B16A16_UNORM,
-            Format::R16G16B16A16Snorm => Self::R16G16B16A16_SNORM,
-            Format::R16G16B16A16Uint => Self::R16G16B16A16_UINT,
-            Format::R16G16B16A16Sint => Self::R16G16B16A16_SINT,
-            Format::R16G16B16A16Float => Self::R16G16B16A16_SFLOAT,
-            Format::R32G32B32A32 => todo!(),
-            Format::R32G32B32A32Uint => Self::R32G32B32A32_UINT,
-            Format::R32G32B32A32Sint => Self::R32G32B32A32_SINT,
-            Format::R32G32B32A32Float => Self::R32G32B32A32_SFLOAT,
-        }
+        Self::UNDEFINED
+        // match value {
+        //     Format::Unknown => Self::UNDEFINED,
+        //     Format::R8 => todo!(),
+        //     Format::R8Unorm => Self::R8_UNORM,
+        //     Format::R8Snorm => Self::R8_SNORM,
+        //     Format::R8Uint => Self::R8_UINT,
+        //     Format::R8Sint => Self::R8_SINT,
+        //     Format::R16 => todo!(),
+        //     Format::R16Unorm => Self::R16_UNORM,
+        //     Format::R16Snorm => Self::R16_SNORM,
+        //     Format::R16Uint => Self::R16_UINT,
+        //     Format::R16Sint => Self::R16_SINT,
+        //     Format::R16Float => Self::R16_SFLOAT,
+        //     Format::D16Unorm => Self::D16_UNORM,
+        //     Format::R32 => todo!(),
+        //     Format::R32Uint => Self::R32_UINT,
+        //     Format::R32Sint => Self::R32_SINT,
+        //     Format::R32Float => Self::R32_SFLOAT,
+        //     Format::D32Float => Self::D32_SFLOAT,
+        //     Format::R8G8 => todo!(),
+        //     Format::R8G8Unorm => Self::R8G8_UNORM,
+        //     Format::R8G8Snorm => Self::R8G8_SNORM,
+        //     Format::R8G8Uint => Self::R8G8_UINT,
+        //     Format::R8G8Sint => Self::R8G8_SINT,
+        //     Format::R16G16 => todo!(),
+        //     Format::R16G16Unorm => Self::R16G16_UNORM,
+        //     Format::R16G16Snorm => Self::R16G16_SNORM,
+        //     Format::R16G16Uint => Self::R16G16_UINT,
+        //     Format::R16G16Sint => Self::R16G16_SINT,
+        //     Format::R16G16Float => Self::R16G16_SFLOAT,
+        //     Format::D24UnormS8Uint => Self::D24_UNORM_S8_UINT,
+        //     Format::R32G32 => todo!(),
+        //     Format::R32G32Uint => Self::R32G32_UINT,
+        //     Format::R32G32Sint => Self::R32G32_SINT,
+        //     Format::R32G32Float => Self::R32G32_SFLOAT,
+        //     Format::R11G11B10Float => todo!(),
+        //     Format::R32G32B32 => todo!(),
+        //     Format::R32G32B32Uint => Self::R32G32B32_UINT,
+        //     Format::R32G32B32Sint => Self::R32G32B32_SINT,
+        //     Format::R32G32B32Float => Self::R32G32B32_SFLOAT,
+        //     Format::R8G8B8A8 => todo!(),
+        //     Format::R8G8B8A8Unorm => Self::R8G8B8A8_UNORM,
+        //     Format::R8G8B8A8Snorm => Self::R8G8B8A8_SNORM,
+        //     Format::R8G8B8A8Uint => Self::R8G8B8A8_UINT,
+        //     Format::R8G8B8A8Sint => Self::R8G8B8A8_SINT,
+        //     Format::R8G8B8A8Srgb => Self::R8G8B8A8_SRGB,
+        //     Format::R10G10B10A2 => todo!(),
+        //     Format::R10G10B10A2Unorm => todo!(),
+        //     Format::R10G10B10A2Uint => todo!(),
+        //     Format::R16G16B16A16 => todo!(),
+        //     Format::R16G16B16A16Unorm => Self::R16G16B16A16_UNORM,
+        //     Format::R16G16B16A16Snorm => Self::R16G16B16A16_SNORM,
+        //     Format::R16G16B16A16Uint => Self::R16G16B16A16_UINT,
+        //     Format::R16G16B16A16Sint => Self::R16G16B16A16_SINT,
+        //     Format::R16G16B16A16Float => Self::R16G16B16A16_SFLOAT,
+        //     Format::R32G32B32A32 => todo!(),
+        //     Format::R32G32B32A32Uint => Self::R32G32B32A32_UINT,
+        //     Format::R32G32B32A32Sint => Self::R32G32B32A32_SINT,
+        //     Format::R32G32B32A32Float => Self::R32G32B32A32_SFLOAT,
+        // }
     }
 }
