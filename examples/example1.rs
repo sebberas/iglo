@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::time::*;
 
 use ::futures::executor::*;
@@ -18,7 +19,7 @@ fn main() {
         window.show();
         while !window.should_close() {
             let _ = window.poll_events();
-            renderer.update(window.extent());
+            renderer.update(window.inner_extent());
         }
     };
 
@@ -62,7 +63,16 @@ impl Renderer {
             device.new_render_pass(&attachments).unwrap()
         };
 
-        let swapchain = instance.new_dswapchain(&device, surface).unwrap();
+        let swapchain_props = SwapchainProps {
+            device: &device,
+            surface,
+            images: NonZeroUsize::new(2).unwrap(),
+            image_format: Format::R8G8B8A8Unorm,
+            image_extent: window.inner_extent(),
+            present_mode: PresentMode::FIFO,
+        };
+
+        let swapchain = instance.new_dswapchain(swapchain_props).unwrap();
 
         let vertex_shader = device.new_shader(VERTEX_SHADER_CODE).unwrap();
         let pixel_shader = device.new_shader(PIXEL_SHADER_CODE).unwrap();
@@ -156,8 +166,5 @@ impl Renderer {
         fence.wait(Duration::from_secs_f32(10.0)).unwrap();
 
         self.swapchain.present(&image).unwrap();
-
-        let end = std::time::Instant::now();
-        println!("{:?}", end - start);
     }
 }

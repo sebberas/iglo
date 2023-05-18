@@ -3,14 +3,14 @@
 //! # Using Multiple Backends
 //!
 //! Mixing of objects that are not using the same [backend][Backend] will cause
-//! the program to panic with a [`BackendError`]. For example supplying an
+//! the program to panic with a [`BackendError`]. As an example supplying an
 //! [adapter][Adapter] which is using [`Backend::DX12`] to a
 //! [instance][Instance] that is running [vulkan][`Backend::Vulkan`] will cause
 //! one of these panics.
 //!
-//! This behaviour is not documented under a panics section since it
-//! applies to all functions/methods that takes any of the backend-agnostic
-//! objects as an argument.
+//! This behaviour is not documented under a separate panics section for the
+//! individual items since it applies to all functions/methods that takes any of
+//! the backend-agnostic objects as an argument.
 
 use std::borrow::Cow;
 use std::marker::PhantomData;
@@ -25,6 +25,7 @@ use self::operations::{OperationsError, OperationsType};
 use self::sync::GpuFuture;
 use self::vulkan::{Shader, ShaderStage};
 use crate::os::Window;
+use crate::rhi;
 
 pub mod sync;
 
@@ -263,12 +264,19 @@ impl Instance {
     /// Creates a new swapchain where the format is not known at compile time.
     ///
     /// The size of the swapchain images are the current size of `surface`.
-    pub fn new_dswapchain(&self, device: &Device, surface: Surface) -> Result<DSwapchain, Error> {
+    pub fn new_dswapchain(&self, props: SwapchainProps) -> Result<DSwapchain, Error> {
         match &self {
-            Self::Vulkan(i) => {
-                let device = device.try_into().unwrap();
-                let surface = surface.try_into().unwrap();
-                i.new_swapchain(device, surface).map(Into::into)
+            Self::Vulkan(instance) => {
+                let props = SwapchainProps {
+                    device: props.device.try_into().unwrap(),
+                    surface: props.surface.try_into().unwrap(),
+                    images: props.images,
+                    image_format: props.image_format,
+                    image_extent: props.image_extent,
+                    present_mode: props.present_mode,
+                };
+
+                instance.new_swapchain(props).map(Into::into)
             }
         }
     }
@@ -920,6 +928,7 @@ pub enum RenderPass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     R8G8B8A8Unorm,
+    R8G8B8A8Srgb,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1011,6 +1020,19 @@ pub struct PipelineProps {}
 
 pub enum Pipeline {
     Vulkan(vulkan::Pipeline),
+}
+
+pub enum PresentMode {
+    FIFO,
+}
+
+pub struct SwapchainProps<'a, D = rhi::Device, S = rhi::Surface> {
+    pub device: &'a D,
+    pub surface: S,
+    pub images: NonZeroUsize,
+    pub image_format: Format,
+    pub image_extent: UVec2,
+    pub present_mode: PresentMode,
 }
 
 pub enum DSwapchain {

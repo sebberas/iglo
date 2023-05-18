@@ -131,9 +131,23 @@ impl os::WindowApi for Window {
         Ok(Self(window_data))
     }
 
-    fn extent(&self) -> UVec2 {
+    fn inner_extent(&self) -> UVec2 {
         let mut rect = RECT::default();
         unsafe { GetClientRect(self.0.hwnd, &mut rect) };
+
+        let RECT {
+            left,
+            top,
+            right,
+            bottom,
+        } = rect;
+
+        uvec2((right - left) as _, (bottom - top) as _)
+    }
+
+    fn outer_extent(&self) -> UVec2 {
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(self.0.hwnd, &mut rect) };
 
         let RECT {
             left,

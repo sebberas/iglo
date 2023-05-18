@@ -66,6 +66,12 @@ impl std::fmt::Debug for InstanceShared {
 pub struct Instance(Arc<InstanceShared>);
 
 impl Instance {
+    pub fn raw(&self) -> &ash::Instance {
+        &self.0.instance
+    }
+}
+
+impl Instance {
     const ENGINE_NAME: &'static CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"iglo\0") };
 
     pub fn new(debug: bool) -> Result<Self> {
@@ -203,49 +209,46 @@ impl Instance {
         })))
     }
 
-    pub fn new_swapchain(&self, device: &Device, surface: Surface) -> Result<DSwapchain> {
-        use vk::{
-            ColorSpaceKHR, CompositeAlphaFlagsKHR, Format, ImageUsageFlags, PresentModeKHR,
-            SharingMode, SurfaceTransformFlagsKHR, SwapchainCreateFlagsKHR, SwapchainCreateInfoKHR,
-            SwapchainKHR,
+    pub fn new_swapchain(&self, props: SwapchainProps<'_, Device, Surface>) -> Result<DSwapchain> {
+        let SwapchainProps {
+            device,
+            surface,
+            images,
+            image_extent,
+            image_format,
+            present_mode,
+        } = props;
+
+        let image_format = match image_format {
+            Format::R8G8B8A8Srgb => vk::Format::R8G8B8A8_UNORM,
+            format => format.into(),
         };
 
-        let surface_capabilities = unsafe {
-            surface.extension.get_physical_device_surface_capabilities(
-                device.0.physical_device,
-                *surface.raw(),
-            )?
+        let image_extent = vk::Extent2D {
+            width: image_extent.x,
+            height: image_extent.y,
         };
 
-        let surface_formats = unsafe {
-            surface
-                .extension
-                .get_physical_device_surface_formats(device.0.physical_device, *surface.raw())?
+        let present_mode = match present_mode {
+            PresentMode::FIFO => vk::PresentModeKHR::FIFO,
         };
 
-        let format = Format::R8G8B8A8_UNORM;
-        let extent = surface_capabilities.current_extent;
-        println!("{extent:?}");
-
-        let present_mode = PresentModeKHR::FIFO;
-
-        let extension = khr::Swapchain::new(self.0.raw(), device.0.raw());
-        let create_info = SwapchainCreateInfoKHR::builder()
-            .flags(SwapchainCreateFlagsKHR::empty())
+        let extension = khr::Swapchain::new(self.raw(), device.raw());
+        let create_info = vk::SwapchainCreateInfoKHR::builder()
             .surface(*surface.raw())
-            .min_image_count(1)
-            .image_format(format)
-            .image_color_space(ColorSpaceKHR::SRGB_NONLINEAR)
-            .image_extent(extent)
+            .min_image_count(images.get() as _)
+            .image_format(image_format)
+            .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            .image_extent(image_extent)
             .image_array_layers(1)
-            .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
-            .image_sharing_mode(SharingMode::EXCLUSIVE)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .queue_family_indices(&[])
-            .pre_transform(SurfaceTransformFlagsKHR::IDENTITY)
-            .composite_alpha(CompositeAlphaFlagsKHR::OPAQUE)
+            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(present_mode)
             .clipped(false)
-            .old_swapchain(SwapchainKHR::null());
+            .old_swapchain(vk::SwapchainKHR::null());
 
         let swapchain = unsafe { extension.create_swapchain(&create_info, None)? };
         let images = unsafe { extension.get_swapchain_images(swapchain)? };
@@ -264,7 +267,7 @@ impl Instance {
                 .flags(vk::ImageViewCreateFlags::empty())
                 .image(*image)
                 .view_type(vk::ImageViewType::TYPE_2D)
-                .format(format)
+                .format(image_format)
                 .subresource_range(subresource_range)
                 .build();
 
@@ -275,7 +278,7 @@ impl Instance {
             extension,
             surface,
             swapchain,
-            format,
+            image_format,
             images,
             image_views,
             _device: Arc::clone(&device.0),
@@ -968,7 +971,7 @@ impl Drop for Device {
 struct SwapchainShared {
     extension: khr::Swapchain,
     swapchain: vk::SwapchainKHR,
-    format: vk::Format,
+    image_format: vk::Format,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     surface: Surface,
@@ -980,7 +983,7 @@ impl std::fmt::Debug for SwapchainShared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SwapchainShared")
             .field("swapchain", &self.swapchain)
-            .field("format", &self.format)
+            .field("image_format", &self.image_format)
             .field("images", &self.images)
             .field("image_views", &self.image_views)
             .field("surface", &self.surface)

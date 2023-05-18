@@ -13,7 +13,8 @@ enum Cursor {
 trait WindowApi: Sized {
     fn new(title: &str) -> Result<Self, imp::WindowError>;
 
-    fn extent(&self) -> UVec2;
+    fn inner_extent(&self) -> UVec2;
+    fn outer_extent(&self) -> UVec2;
 
     fn show(&mut self);
     fn hide(&mut self);
@@ -36,8 +37,13 @@ impl Window {
     }
 
     #[inline]
-    pub fn extent(&self) -> UVec2 {
-        self.0.extent()
+    pub fn inner_extent(&self) -> UVec2 {
+        self.0.inner_extent()
+    }
+
+    #[inline]
+    pub fn outer_extent(&self) -> UVec2 {
+        self.0.outer_extent()
     }
 
     #[inline]
