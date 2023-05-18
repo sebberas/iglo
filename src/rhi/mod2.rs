@@ -191,7 +191,7 @@ impl Instance {
     ///
     /// # Panics
     ///
-    /// - Panics if the format is [`Format::Unknown`]
+    /// - Panics if the format is [`Format::Unknown`](Format)
     /// - Panics if [`SwapchainProps::width`] or [`SwapchainProps::height`] are
     /// larger than the size allowed by the API.
     pub fn new_swapchain<'a, P, F>(&self, props: P) -> Result<Swapchain<F>>

@@ -1,6 +1,8 @@
 #[cfg(windows)]
 pub mod windows;
 
+use glam::UVec2;
+
 #[cfg(windows)]
 use self::windows as imp;
 
@@ -10,6 +12,8 @@ enum Cursor {
 
 trait WindowApi: Sized {
     fn new(title: &str) -> Result<Self, imp::WindowError>;
+
+    fn extent(&self) -> UVec2;
 
     fn show(&mut self);
     fn hide(&mut self);
@@ -29,6 +33,11 @@ impl Window {
     #[inline]
     pub fn new(title: &str) -> Result<Self, WindowError> {
         imp::Window::new(title).map(Self).map_err(WindowError)
+    }
+
+    #[inline]
+    pub fn extent(&self) -> UVec2 {
+        self.0.extent()
     }
 
     #[inline]

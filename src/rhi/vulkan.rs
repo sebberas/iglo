@@ -1,18 +1,20 @@
 use std::ffi::*;
+use std::mem::ManuallyDrop;
 use std::ops::{Range, RangeInclusive};
 use std::sync::*;
 use std::time::Duration;
 
-use ash::extensions::*;
-use ash::{vk, Entry};
-use glam::UVec2;
+use ::ash::extensions::*;
+use ::ash::{vk, Entry};
+use ::glam::UVec2;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::*;
-use windows::Win32::System::Threading::*;
-use windows::Win32::System::WindowsProgramming::*;
+use ::windows::Win32::Foundation::*;
+use ::windows::Win32::System::Threading::*;
+use ::windows::Win32::System::WindowsProgramming::*;
+use ash::vk::Viewport;
 
 use crate::rhi::macros::*;
-use crate::rhi::*;
+use crate::rhi::{self, *};
 
 impl From<vk::Result> for Error {
     fn from(value: vk::Result) -> Self {
@@ -50,6 +52,14 @@ struct InstanceShared {
 impl InstanceShared {
     fn raw(&self) -> &ash::Instance {
         &self.instance
+    }
+}
+
+impl std::fmt::Debug for InstanceShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceShared")
+            .field("physical_devices", &self.physical_devices)
+            .finish_non_exhaustive()
     }
 }
 
@@ -98,8 +108,8 @@ impl Instance {
 
         let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
             .flags(vk::Win32SurfaceCreateFlagsKHR::empty())
-            .hinstance(unsafe { &*window }.hinstance().0 as *const _)
-            .hwnd(unsafe { &*window }.hwnd().0 as *const _);
+            .hinstance(window.hinstance().0 as *const _)
+            .hwnd(window.hwnd().0 as *const _);
 
         let surface = unsafe { win32_extension.create_win32_surface(&create_info, None)? };
         let extension = khr::Surface::new(&self.0.entry, &self.0.instance);
@@ -132,15 +142,25 @@ impl Instance {
     /// # Panics
     ///
     /// Panics if `props.adapter` doesn't support `props.surface`.
-    pub fn new_device(&self, props: DeviceProps) -> Result<Device> {
+    // TODO: Rewrite
+    // TODO: Implementations are valid if they support the extensions before they
+    // got included into the 1.1, 1.2 or 1.3 spec.
+    pub fn new_device(
+        &self,
+        surface: Option<&Surface>,
+        adapter: Option<Adapter>,
+        props: DeviceProps,
+    ) -> Result<Device> {
         let InstanceShared { instance, .. } = &*self.0;
         let physical_devices = &self.0.physical_devices;
 
-        let adapter = props.adapter.as_ref().unwrap_or_else(|| todo!());
-        let surface = props.surface.as_ref().unwrap_or_else(|| todo!());
+        let surface = surface.unwrap();
+        let adapter = adapter.unwrap();
+
         assert!(adapter.is_surface_supported(surface)?);
 
-        let physical_device = physical_devices[adapter.physical_device_index];
+        let physical_device_index = adapter.physical_device_index;
+        let physical_device = physical_devices[physical_device_index];
 
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
@@ -158,7 +178,16 @@ impl Instance {
             names
         };
 
+        let mut features = vk::PhysicalDeviceFeatures2::builder();
+        unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+
+        let mut timeline_features =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::builder().timeline_semaphore(true);
+
+        let mut features = features.push_next(&mut timeline_features);
+
         let create_info = vk::DeviceCreateInfo::builder()
+            .push_next(&mut features)
             .queue_create_infos(&queue_create_infos)
             .enabled_layer_names(&enabled_layer_names)
             .enabled_extension_names(&enabled_extension_names);
@@ -167,13 +196,14 @@ impl Instance {
 
         Ok(Device(Arc::new(DeviceShared {
             device,
+            physical_device_index,
             physical_device,
             queue_family_indices,
             _instance: Arc::clone(&self.0),
         })))
     }
 
-    pub fn new_swapchain(&self, device: &Device, surface: Surface) -> Result<Swapchain> {
+    pub fn new_swapchain(&self, device: &Device, surface: Surface) -> Result<DSwapchain> {
         use vk::{
             ColorSpaceKHR, CompositeAlphaFlagsKHR, Format, ImageUsageFlags, PresentModeKHR,
             SharingMode, SurfaceTransformFlagsKHR, SwapchainCreateFlagsKHR, SwapchainCreateInfoKHR,
@@ -187,14 +217,15 @@ impl Instance {
             )?
         };
 
-        let _surface_formats = unsafe {
+        let surface_formats = unsafe {
             surface
                 .extension
                 .get_physical_device_surface_formats(device.0.physical_device, *surface.raw())?
         };
 
-        let image_format = Format::R8G8B8A8_UNORM;
-        let image_extent = surface_capabilities.current_extent;
+        let format = Format::R8G8B8A8_UNORM;
+        let extent = surface_capabilities.current_extent;
+        println!("{extent:?}");
 
         let present_mode = PresentModeKHR::FIFO;
 
@@ -203,9 +234,9 @@ impl Instance {
             .flags(SwapchainCreateFlagsKHR::empty())
             .surface(*surface.raw())
             .min_image_count(1)
-            .image_format(image_format)
+            .image_format(format)
             .image_color_space(ColorSpaceKHR::SRGB_NONLINEAR)
-            .image_extent(image_extent)
+            .image_extent(extent)
             .image_array_layers(1)
             .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
             .image_sharing_mode(SharingMode::EXCLUSIVE)
@@ -219,11 +250,34 @@ impl Instance {
         let swapchain = unsafe { extension.create_swapchain(&create_info, None)? };
         let images = unsafe { extension.get_swapchain_images(swapchain)? };
 
-        Ok(Swapchain(Arc::new(SwapchainShared {
+        let mut image_views = Vec::with_capacity(images.len());
+        for image in &images {
+            let subresource_range = vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build();
+
+            let create_info = vk::ImageViewCreateInfo::builder()
+                .flags(vk::ImageViewCreateFlags::empty())
+                .image(*image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(subresource_range)
+                .build();
+
+            image_views.push(unsafe { device.raw().create_image_view(&create_info, None) }?);
+        }
+
+        Ok(DSwapchain(Arc::new(SwapchainShared {
             extension,
             surface,
             swapchain,
+            format,
             images,
+            image_views,
             _device: Arc::clone(&device.0),
             _instance: Arc::clone(&self.0),
         })))
@@ -269,20 +323,26 @@ impl Instance {
 
     fn find_physical_devices(instance: &ash::Instance) -> Result<Vec<vk::PhysicalDevice>> {
         let physical_device_groups = unsafe {
-            let len = instance.enumerate_physical_device_groups_len()?;
-
-            let mut buf = vec![Default::default(); len];
+            let mut buf =
+                vec![Default::default(); instance.enumerate_physical_device_groups_len()?];
             instance.enumerate_physical_device_groups(buf.as_mut())?;
 
             buf
         };
 
+        println!(
+            "{:?}",
+            unsafe { instance.enumerate_physical_devices() }.unwrap()
+        );
+
         let physical_device_group = physical_device_groups[0];
 
         let physical_devices = {
             let len = physical_device_group.physical_device_count as _;
-            &physical_device_group.physical_devices[0..len]
+            Vec::from(&physical_device_group.physical_devices[0..len])
         };
+
+        println!("{physical_devices:?}");
 
         let is_supported = |physical_device: vk::PhysicalDevice| {
             use vk::{api_version_major, api_version_minor, PhysicalDeviceProperties};
@@ -342,10 +402,20 @@ impl Instance {
     }
 }
 
+impl_try_from_rhi_all!(Vulkan, Device);
+
 pub struct Surface {
     surface: vk::SurfaceKHR,
     extension: khr::Surface,
     _instance: Arc<InstanceShared>,
+}
+
+impl std::fmt::Debug for Surface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Surface")
+            .field("_instance", &self._instance)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Surface {
@@ -361,14 +431,15 @@ impl Drop for Surface {
     }
 }
 
-// impl_try_from_rhi_all!(Vulkan, Surface);
-// impl_into_rhi!(Vulkan, Surface);
+impl_try_from_rhi_all!(Vulkan, Surface);
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Adapter {
     physical_device_index: usize,
     _instance: Arc<InstanceShared>,
 }
+
+impl_try_from_rhi_all!(Vulkan, Adapter);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QueueFamilyIndices {
@@ -482,6 +553,10 @@ impl Adapter {
         true
     }
 
+    fn has_required_features() -> bool {
+        true
+    }
+
     // TODO: Find the family with the most amount of queues.
     fn find_queue_family_indices(props: &[vk::QueueFamilyProperties]) -> QueueFamilyIndices {
         use vk::{QueueFamilyProperties, QueueFlags};
@@ -514,26 +589,23 @@ impl Adapter {
     }
 }
 
-#[derive(Default)]
-pub struct DeviceProps<'a> {
-    pub surface: Option<&'a Surface>,
-    pub adapter: Option<Adapter>,
-    pub graphics_queues: Option<Range<usize>>,
-    pub compute_queues: Option<Range<usize>>,
-    pub transfer_queues: Option<Range<usize>>,
-}
-
-impl<'a> AsRef<DeviceProps<'a>> for DeviceProps<'a> {
-    fn as_ref(&self) -> &DeviceProps<'a> {
-        self
-    }
-}
-
 struct DeviceShared {
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
+    physical_device_index: usize,
     queue_family_indices: QueueFamilyIndices,
     _instance: Arc<InstanceShared>,
+}
+
+impl std::fmt::Debug for DeviceShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceShared")
+            .field("physical_device", &self.physical_device)
+            .field("physical_device_index", &self.physical_device_index)
+            .field("queue_family_indies", &self.queue_family_indices)
+            .field("_instance", &self._instance)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DeviceShared {
@@ -601,251 +673,289 @@ impl Device {
         })
     }
 
-    pub fn new_render_pass(&self, props: &RenderPassProps) -> Result<RenderPass> {
-        let mut attachments = Vec::with_capacity(props.attachments.len());
-        let mut attachment_refs = Vec::with_capacity(props.attachments.len());
-        for (i, attachment) in props.attachments.iter().enumerate() {
-            let attachment = vk::AttachmentDescription::builder()
-                .format(attachment.format.into())
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(attachment.load_op.into())
-                .store_op(attachment.store_op.into())
-                .stencil_load_op(attachment.stencil_load_op.into())
-                .stencil_store_op(attachment.stencil_store_op.into())
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+    pub fn new_semaphore(&self, value: u64) -> Result<Semaphore> {
+        use vk::{SemaphoreCreateInfo, SemaphoreType, SemaphoreTypeCreateInfo};
 
-            attachments.push(attachment.build());
+        let mut timeline_create_info = SemaphoreTypeCreateInfo::builder()
+            .initial_value(value)
+            .semaphore_type(SemaphoreType::TIMELINE);
 
-            let attachment_ref = vk::AttachmentReference::builder()
-                .attachment(i as _)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let create_info = SemaphoreCreateInfo::builder().push_next(&mut timeline_create_info);
 
-            attachment_refs.push(attachment_ref.build());
-        }
+        let semaphore = unsafe { self.0.raw().create_semaphore(&create_info, None)? };
 
-        let subpasses = [vk::SubpassDescription::builder()
-            .color_attachments(&attachment_refs[0..1])
-            .build()];
-
-        let create_info = vk::RenderPassCreateInfo::builder()
-            .attachments(&attachments)
-            .subpasses(&subpasses)
-            .dependencies(&[]);
-
-        let render_pass = unsafe { self.0.raw().create_render_pass(&create_info, None)? };
-        Ok(RenderPass {
-            render_pass,
+        Ok(Semaphore {
+            semaphore,
             _device: Arc::clone(&self.0),
         })
-    }
-
-    pub fn new_framebuffer(
-        &self,
-        image_view: &DImageView,
-        render_pass: &RenderPass,
-    ) -> Result<Framebuffer> {
-        let attachment = [*image_view.raw()];
-
-        let create_info = vk::FramebufferCreateInfo::builder()
-            .render_pass(*render_pass.raw())
-            .attachments(&attachment)
-            .width(640)
-            .height(480)
-            .layers(1);
-
-        let framebuffer = unsafe { self.0.raw().create_framebuffer(&create_info, None)? };
-        Ok(Framebuffer {
-            framebuffer,
-            _device: Arc::clone(&self.0),
-        })
-    }
-
-    pub fn new_shader(&self, src: &[u8]) -> Result<Shader> {
-        use vk::{ShaderModuleCreateFlags, ShaderModuleCreateInfo};
-
-        let mut create_info = ShaderModuleCreateInfo::builder();
-        create_info.code_size = src.len();
-        create_info.p_code = src.as_ptr() as *const _;
-
-        let shader = unsafe { self.0.raw().create_shader_module(&create_info, None)? };
-
-        Ok(Shader {
-            shader,
-            _device: Arc::clone(&self.0),
-        })
-    }
-
-    /// Creates a new pipeline.
-    ///
-    /// # Panics
-    ///
-    /// Panics the same variant of [ShaderStage] is specified twice in
-    /// [PipelineShaderStage::stage](PipelineShaderStage).
-    pub fn new_pipeline<'a, 'b, P>(&self, props: &P) -> Result<Pipeline<'a>>
-    where
-        P: AsRef<PipelineProps<'a, 'b>>,
-        'a: 'b,
-    {
-        use vk::{
-            GraphicsPipelineCreateInfo, PipelineCache, PipelineShaderStageCreateFlags,
-            PipelineShaderStageCreateInfo,
-        };
-
-        let props = props.as_ref();
-
-        let entrypoints: Vec<_> = props
-            .stages
-            .iter()
-            .map(|PipelineShaderStage { entrypoint, .. }| {
-                CString::new(entrypoint.to_string()).unwrap()
-            })
-            .collect();
-
-        let mut stages = Vec::with_capacity(6);
-        for (i, stage) in props.stages.iter().enumerate() {
-            let PipelineShaderStage { stage, shader, .. } = stage;
-
-            let create_info = PipelineShaderStageCreateInfo::builder()
-                .flags(PipelineShaderStageCreateFlags::empty())
-                .stage((*stage).into())
-                .module(*shader.raw())
-                .name(&entrypoints[i])
-                .build();
-
-            stages.push(create_info);
-        }
-
-        let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
-            .vertex_attribute_descriptions(&[])
-            .vertex_binding_descriptions(&[]);
-
-        let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(false);
-
-        let scissor = [vk::Rect2D::builder()
-            .offset(vk::Offset2D { x: 0, y: 0 })
-            .extent(vk::Extent2D {
-                width: 640,
-                height: 480,
-            })
-            .build()];
-
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-            .viewports(&[vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: 640.0,
-                height: 480.0,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }])
-            .scissors(&scissor);
-
-        let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
-            .depth_clamp_enable(false)
-            .rasterizer_discard_enable(false)
-            .polygon_mode(vk::PolygonMode::FILL)
-            .line_width(1.0)
-            .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::CLOCKWISE);
-
-        let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
-            .sample_shading_enable(false)
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-            .min_sample_shading(1.0)
-            .sample_mask(&[])
-            .alpha_to_coverage_enable(false)
-            .alpha_to_one_enable(false);
-
-        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::builder();
-
-        let attachment = [vk::PipelineColorBlendAttachmentState::builder()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ONE)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .build()];
-
-        let color_blend_state =
-            vk::PipelineColorBlendStateCreateInfo::builder().attachments(&attachment);
-
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
-
-        let pipeline_layout = self.setup_vk_pipeline_layout(&props.layout)?;
-
-        let create_info = GraphicsPipelineCreateInfo::builder()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input_state)
-            .input_assembly_state(&input_assembly_state)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization_state)
-            .multisample_state(&multisample_state)
-            // .depth_stencil_state(&depth_stencil_state)
-            .color_blend_state(&color_blend_state)
-            .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
-            .render_pass(*props.render_pass.raw())
-            .build();
-
-        let pipeline = unsafe {
-            self.0
-                .raw()
-                .create_graphics_pipelines(PipelineCache::null(), &[create_info], None)
-        }
-        .unwrap()[0];
-
-        Ok(Pipeline {
-            pipeline,
-            pipeline_layout,
-            _device: Arc::clone(&self.0),
-            _marker: PhantomData,
-        })
-    }
-
-    fn setup_vk_pipeline_layout(&self, layout: &PipelineLayout) -> Result<vk::PipelineLayout> {
-        use vk::{PipelineLayoutCreateFlags, PipelineLayoutCreateInfo};
-
-        let create_info = PipelineLayoutCreateInfo::builder()
-            .flags(PipelineLayoutCreateFlags::empty())
-            .set_layouts(&[])
-            .push_constant_ranges(&[]);
-
-        unsafe {
-            self.0
-                .raw()
-                .create_pipeline_layout(&create_info, None)
-                .map_err(Into::into)
-        }
     }
 
     pub fn new_fence(&self, signaled: bool) -> Result<Fence> {
-        let flags = signaled
-            .then_some(vk::FenceCreateFlags::SIGNALED)
-            .unwrap_or_default();
+        use vk::{FenceCreateFlags, FenceCreateInfo};
 
-        let create_info = vk::FenceCreateInfo::builder().flags(flags);
+        let mut flags = FenceCreateFlags::empty();
+        if signaled {
+            flags |= FenceCreateFlags::SIGNALED
+        }
 
+        let create_info = FenceCreateInfo::builder().flags(flags);
         let fence = unsafe { self.0.raw().create_fence(&create_info, None)? };
+
         Ok(Fence {
             fence,
             _device: Arc::clone(&self.0),
         })
     }
 
-    pub fn new_semaphore(&self) -> Result<Semaphore> {
-        let create_info = vk::SemaphoreCreateInfo::builder();
-        let semaphore = unsafe { self.0.raw().create_semaphore(&create_info, None)? };
-        Ok(Semaphore {
-            semaphore,
+    pub fn new_image_2d(&self) -> Result<DImage2D> {
+        todo!()
+    }
+
+    pub fn new_image_3d(&self) -> Result<()> {
+        todo!()
+    }
+
+    pub fn new_render_pass(&self, attachments: &[Attachment]) -> Result<RenderPass> {
+        let attachments: Vec<_> = attachments
+            .iter()
+            .map(|attachment| match attachment {
+                Attachment::Color {
+                    format,
+                    load_op,
+                    store_op,
+                    layout,
+                } => vk::AttachmentDescription::builder()
+                    .format(Into::<_>::into(*format))
+                    .load_op(Into::<_>::into(*load_op))
+                    .store_op(Into::<_>::into(*store_op))
+                    .final_layout(match layout {
+                        Layout::Undefined => vk::ImageLayout::UNDEFINED,
+                        Layout::Preinitialized => vk::ImageLayout::PREINITIALIZED,
+                        Layout::General => vk::ImageLayout::GENERAL,
+                        Layout::Present => vk::ImageLayout::PRESENT_SRC_KHR,
+                    })
+                    .samples(vk::SampleCountFlags::TYPE_1),
+                Attachment::DepthStencil {
+                    format,
+                    depth_load_op,
+                    depth_store_op,
+                    stencil_load_op,
+                    stencil_store_op,
+                } => vk::AttachmentDescription::builder()
+                    .format(Into::<_>::into(*format))
+                    .load_op(Into::<_>::into(depth_load_op.unwrap_or_default()))
+                    .store_op(Into::<_>::into(depth_store_op.unwrap_or_default()))
+                    .stencil_load_op(Into::<_>::into(stencil_load_op.unwrap_or_default()))
+                    .store_op(Into::<_>::into(stencil_store_op.unwrap_or_default()))
+                    .final_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                    .samples(vk::SampleCountFlags::TYPE_1),
+            })
+            .map(|e| e.build())
+            .collect();
+
+        let references = [vk::AttachmentReference::builder()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .build()];
+
+        let subpasses = [vk::SubpassDescription::builder()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&references)
+            .build()];
+
+        let create_info = vk::RenderPassCreateInfo::builder()
+            .attachments(&attachments)
+            .subpasses(&subpasses);
+
+        let render_pass = unsafe { self.0.raw().create_render_pass(&create_info, None)? };
+
+        Ok(RenderPass {
+            render_pass,
             _device: Arc::clone(&self.0),
         })
+    }
+
+    pub fn new_framebuffer<'a, A>(
+        &self,
+        render_pass: &RenderPass,
+        attachments: A,
+        extent: UVec2,
+    ) -> Result<Framebuffer>
+    where
+        A: Iterator<Item = &'a DImageView2D>,
+    {
+        let attachments: Vec<_> = attachments
+            .map(|DImageView2D { kind }| match kind {
+                DImageViewKind2D::Owned(a) => *a,
+                DImageViewKind2D::Swapchain(i, swapchain) => swapchain.image_views[*i],
+            })
+            .collect();
+
+        // Find the smallest width and height in the `attachments`.
+        let create_info = vk::FramebufferCreateInfo::builder()
+            .render_pass(*render_pass.raw())
+            .width(extent.x)
+            .height(extent.y)
+            .attachments(&attachments)
+            .layers(1);
+
+        let framebuffer = unsafe { self.0.raw().create_framebuffer(&create_info, None)? };
+
+        Ok(Framebuffer {
+            framebuffer,
+            _device: Arc::clone(&self.0),
+        })
+    }
+
+    pub fn new_shader(&self, bytecode: &[u8]) -> Result<Shader> {
+        let code: Vec<_> = bytecode
+            .iter()
+            .cloned()
+            .array_chunks::<4>()
+            .map(u32::from_ne_bytes)
+            .collect();
+
+        let create_info = vk::ShaderModuleCreateInfo::builder().code(&code).build();
+
+        let shader = unsafe { self.raw().create_shader_module(&create_info, None)? };
+        Ok(Shader {
+            shader,
+            _device: Arc::clone(&self.0),
+        })
+    }
+
+    pub fn new_pipeline(
+        &self,
+        state: &PipelineState,
+        shaders: &[(Shader, ShaderStage)],
+        render_pass: &RenderPass,
+    ) -> Result<Pipeline> {
+        const ENTRYPOINT: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
+
+        let layout = self.new_pipeline_layout()?;
+
+        let mut stages = vec![];
+
+        for (shader, stage) in shaders {
+            let stage = match stage {
+                ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
+                ShaderStage::Pixel => vk::ShaderStageFlags::FRAGMENT,
+                _ => todo!(),
+            };
+
+            stages.push(
+                vk::PipelineShaderStageCreateInfo::builder()
+                    .stage(stage)
+                    .module(*shader.raw())
+                    .name(ENTRYPOINT)
+                    .build(),
+            );
+        }
+
+        let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
+            .vertex_binding_descriptions(&[])
+            .vertex_attribute_descriptions(&[]);
+
+        let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false);
+
+        let viewports = [vk::Viewport::builder()
+            .x(0.0)
+            .y(0.0)
+            .width(1200.0)
+            .height(800.0)
+            .min_depth(0.0)
+            .max_depth(1.0)
+            .build()];
+
+        let scissors = [vk::Rect2D::default()];
+
+        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+            .viewports(&viewports)
+            .scissors(&scissors);
+
+        let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .depth_bias_enable(false)
+            .depth_bias_constant_factor(0.0)
+            .depth_bias_clamp(0.0)
+            .depth_bias_slope_factor(0.0)
+            .line_width(1.0);
+
+        let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        let attachments = [vk::PipelineColorBlendAttachmentState::builder()
+            .blend_enable(false)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ZERO)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .build()];
+
+        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+            .logic_op_enable(false)
+            .logic_op(vk::LogicOp::COPY)
+            .attachments(&attachments)
+            .blend_constants([0.0, 0.0, 0.0, 0.0]);
+
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
+
+        let create_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input_state)
+            .input_assembly_state(&input_assembly_state)
+            // .tessellation_state(tessellation_state)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization_state)
+            .multisample_state(&multisample_state)
+            // .depth_stencil_state(depth_stencil_state)
+            .color_blend_state(&color_blend_state)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .render_pass(*render_pass.raw())
+            .subpass(0)
+            .build();
+
+        let pipeline = unsafe {
+            self.raw()
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .unwrap()[0]
+        };
+
+        Ok(Pipeline {
+            pipeline,
+            layout,
+            _device: Arc::clone(&self.0),
+        })
+    }
+
+    pub fn wait_idle(&self) -> Result<()> {
+        unsafe { self.0.raw().device_wait_idle() }.map_err(Into::into)
+    }
+
+    fn raw(&self) -> &ash::Device {
+        &self.0.device
+    }
+}
+
+impl Device {
+    fn new_pipeline_layout(&self) -> Result<vk::PipelineLayout> {
+        let layout_create_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&[])
+            .push_constant_ranges(&[])
+            .build();
+
+        unsafe { self.raw().create_pipeline_layout(&layout_create_info, None) }.map_err(Into::into)
     }
 }
 
@@ -858,65 +968,89 @@ impl Drop for Device {
 struct SwapchainShared {
     extension: khr::Swapchain,
     swapchain: vk::SwapchainKHR,
+    format: vk::Format,
     images: Vec<vk::Image>,
+    image_views: Vec<vk::ImageView>,
     surface: Surface,
     _device: Arc<DeviceShared>,
     _instance: Arc<InstanceShared>,
 }
 
-pub struct Swapchain(Arc<SwapchainShared>);
+impl std::fmt::Debug for SwapchainShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwapchainShared")
+            .field("swapchain", &self.swapchain)
+            .field("format", &self.format)
+            .field("images", &self.images)
+            .field("image_views", &self.image_views)
+            .field("surface", &self.surface)
+            .field("_device", &self._device)
+            .field("_instance", &self._instance)
+            .finish_non_exhaustive()
+    }
+}
 
-impl Swapchain {
-    pub fn image(
+impl Drop for SwapchainShared {
+    fn drop(&mut self) {
+        for image_view in &self.image_views {
+            unsafe { self._device.raw().destroy_image_view(*image_view, None) };
+        }
+
+        unsafe { self.extension.destroy_swapchain(self.swapchain, None) };
+    }
+}
+
+pub struct DSwapchain(Arc<SwapchainShared>);
+
+impl DSwapchain {
+    pub unsafe fn image_unchecked(
         &mut self,
-        semaphore: Option<&mut Semaphore>,
-        fence: Option<&mut Fence>,
-    ) -> Result<Option<DImageView>> {
+        fence: &mut Fence,
+        timeout: Duration,
+    ) -> Result<Option<DImageView2D>> {
         let SwapchainShared { extension, .. } = &*self.0;
-        //  let image_view =
 
-        let timeout = 16 * 1000 * 1000;
-        let semaphore = semaphore.map(|e| *e.raw()).unwrap_or(vk::Semaphore::null());
-        let fence = fence.map(|e| *e.raw()).unwrap_or(vk::Fence::null());
+        let device_mask = self.0._device.physical_device_index + 1;
 
-        let i = unsafe { extension.acquire_next_image(*self.raw(), timeout, semaphore, fence)? }.0;
-        let image = self.0.images[i as usize];
+        let acquire_next_image_info = vk::AcquireNextImageInfoKHR::builder()
+            .swapchain(*self.raw())
+            .timeout(timeout.as_nanos() as _)
+            .fence(*fence.raw())
+            .device_mask(device_mask as _);
 
-        let create_info = vk::ImageViewCreateInfo::builder()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .components(vk::ComponentMapping::default())
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-                ..Default::default()
-            });
+        let result = unsafe { extension.acquire_next_image2(&acquire_next_image_info) };
+        if matches!(result, Err(vk::Result::TIMEOUT)) {
+            return Ok(None);
+        }
 
-        let image_view = unsafe { self.0._device.raw().create_image_view(&create_info, None)? };
-        Ok(Some(DImageView {
-            image_view,
-            kind: DImageViewKind::Swapchain(i as _, Arc::clone(&self.0)),
-            _device: Arc::clone(&self.0._device),
+        let (i, ..) = result?;
+
+        Ok(Some(DImageView2D {
+            kind: DImageViewKind2D::Swapchain(i as _, Arc::clone(&self.0)),
         }))
     }
 
-    pub fn present(&self, queue: &mut DQueue, image_view: &DImageView) -> Result<()> {
-        let SwapchainShared { extension, .. } = &*self.0;
+    pub fn present(&self, image_view: &DImageView2D) -> Result<()> {
+        let SwapchainShared {
+            extension, _device, ..
+        } = &*self.0;
 
         let swapchain = [*self.raw()];
-        let i = match image_view.kind {
-            DImageViewKind::Swapchain(i, _) => [i as _],
+
+        let DImageViewKind2D::Swapchain(i, _) = image_view.kind else {
+            unreachable!();
         };
+
+        let i = [i as _];
 
         let present_info = vk::PresentInfoKHR::builder()
             .swapchains(&swapchain)
             .image_indices(&i);
 
-        let _ = unsafe { extension.queue_present(*queue.0.raw(), &present_info) }?;
+        let graphics_index = _device.queue_family_indices.graphics.unwrap();
+        let graphics_queue = unsafe { _device.raw().get_device_queue(graphics_index as _, 0) };
+
+        let _ = unsafe { extension.queue_present(graphics_queue, &present_info) }?;
         Ok(())
     }
 
@@ -925,10 +1059,12 @@ impl Swapchain {
     }
 }
 
-impl Drop for Swapchain {
-    fn drop(&mut self) {
-        unsafe { self.0.extension.destroy_swapchain(*self.raw(), None) };
-    }
+impl_try_from_rhi_all!(Vulkan, DSwapchain);
+
+pub struct SubmitInfo<'a> {
+    command_lists: Vec<&'a DCommandList>,
+    wait_semaphores: Vec<(&'a Semaphore, u64)>,
+    signal_semaphores: Vec<(&'a Semaphore, u64)>,
 }
 
 struct DQueueShared {
@@ -954,40 +1090,130 @@ impl DQueue {
     /// # Safety
     pub unsafe fn submit_unchecked(
         &mut self,
-        list: &DCommandList,
-        wait: Option<&Semaphore>,
-        signal: &Semaphore,
+        infos: &[SubmitInfo],
         fence: Option<&mut Fence>,
     ) -> Result<()> {
-        let device = self.0._device.raw();
+        let device = &self.0._device.raw();
 
-        let (wait, dst_stage_mask) = if let Some(wait) = wait {
-            (
-                vec![*wait.raw()],
-                vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
-            )
-        } else {
-            (Vec::default(), Vec::default())
-        };
+        let wait_semaphore_values: Vec<u64> = infos
+            .iter()
+            .flat_map(|info| info.wait_semaphores.iter().map(|(_, value)| *value))
+            .collect();
 
-        let submit_info = vk::SubmitInfo::builder()
-            .wait_semaphores(&wait)
-            .wait_dst_stage_mask(&dst_stage_mask)
-            .command_buffers(&[*list.raw()])
-            .signal_semaphores(&[*signal.raw()])
-            .build();
+        let signal_semaphore_values: Vec<u64> = infos
+            .iter()
+            .flat_map(|info| info.signal_semaphores.iter().map(|(_, value)| *value))
+            .collect();
 
-        let fence = fence.map(|e| *e.raw()).unwrap_or(vk::Fence::null());
-        unsafe { device.queue_submit(*self.0.raw(), &[submit_info], fence) }.map_err(Into::into)
+        let mut wait_semaphore_offset = 0;
+        let mut signal_semaphore_offset = 0;
+        let mut timeline_semaphore_submits: Vec<_> = infos
+            .iter()
+            .map(|info| {
+                let wait_values = &wait_semaphore_values
+                    [wait_semaphore_offset..wait_semaphore_offset + info.wait_semaphores.len()];
+
+                let signal_values = &signal_semaphore_values[signal_semaphore_offset
+                    ..signal_semaphore_offset + info.signal_semaphores.len()];
+
+                wait_semaphore_offset += info.wait_semaphores.len();
+                signal_semaphore_offset += info.signal_semaphores.len();
+
+                vk::TimelineSemaphoreSubmitInfo::builder()
+                    .wait_semaphore_values(wait_values)
+                    .signal_semaphore_values(signal_values)
+                    .build()
+            })
+            .collect();
+
+        let command_buffers: Vec<Vec<_>> = infos
+            .iter()
+            .map(|info| {
+                info.command_lists
+                    .iter()
+                    .map(|command_list| command_list.buffer)
+                    .collect()
+            })
+            .collect();
+
+        let wait_semaphores: Vec<Vec<_>> = infos
+            .iter()
+            .map(|info| {
+                info.wait_semaphores
+                    .iter()
+                    .map(|(semaphore, _)| *semaphore.raw())
+                    .collect()
+            })
+            .collect();
+
+        let signal_semaphores: Vec<Vec<_>> = infos
+            .iter()
+            .map(|info| {
+                info.signal_semaphores
+                    .iter()
+                    .map(|(semaphore, _)| *semaphore.raw())
+                    .collect()
+            })
+            .collect();
+
+        let submits: Vec<_> = infos
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                vk::SubmitInfo::builder()
+                    .push_next(&mut timeline_semaphore_submits[i])
+                    .command_buffers(&command_buffers[i])
+                    .wait_semaphores(&wait_semaphores[i])
+                    .signal_semaphores(&signal_semaphores[i])
+                    .build()
+            })
+            .collect();
+
+        let fence = fence.map(|fence| *fence.raw()).unwrap_or_default();
+        unsafe { device.queue_submit(*self.raw(), &submits, fence) }.map_err(Into::into)
     }
 
     pub fn wait_idle(&mut self) -> Result<()> {
         let device = self.0._device.raw();
         unsafe { device.queue_wait_idle(*self.0.raw()) }.map_err(Into::into)
     }
+
+    fn raw(&self) -> &vk::Queue {
+        &self.0.queue
+    }
 }
 
 impl_try_from_rhi_all!(Vulkan, DQueue);
+
+impl<'a> TryFrom<rhi::SubmitInfo<'a>> for SubmitInfo<'a> {
+    type Error = BackendError;
+
+    fn try_from(value: rhi::SubmitInfo<'a>) -> std::result::Result<Self, Self::Error> {
+        let command_lists: Vec<_> = value
+            .command_lists
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<std::result::Result<_, _>>()?;
+
+        let wait_semaphores: Vec<_> = value
+            .wait_semaphores
+            .into_iter()
+            .map(|(semaphore, value)| semaphore.try_into().map(|s| (s, value)))
+            .collect::<std::result::Result<_, _>>()?;
+
+        let signal_semaphores: Vec<_> = value
+            .signal_semaphores
+            .into_iter()
+            .map(|(semaphore, value)| semaphore.try_into().map(|s| (s, value)))
+            .collect::<std::result::Result<_, _>>()?;
+
+        Ok(SubmitInfo {
+            command_lists,
+            wait_semaphores,
+            signal_semaphores,
+        })
+    }
+}
 
 struct DCommandPoolShared {
     pool: vk::CommandPool,
@@ -1009,6 +1235,8 @@ impl Drop for DCommandPoolShared {
 
 pub struct DCommandPool(Arc<DCommandPoolShared>);
 
+impl_try_from_rhi_all!(Vulkan, DCommandPool);
+
 impl DCommandPool {
     pub fn operations(&self) -> Operations {
         self.0._queue.operations
@@ -1027,6 +1255,8 @@ pub struct DCommandList {
     state: State,
     _pool: Arc<DCommandPoolShared>,
 }
+
+impl_try_from_rhi_all!(Vulkan, DCommandList);
 
 impl DCommandList {
     /// Returns the operations supported by this command list
@@ -1103,8 +1333,15 @@ impl DCommandList {
                     height: 480,
                 },
                 ..Default::default()
-            })
-            .clear_values(&clear_value);
+            });
+        // .render_area(vk::Rect2D {
+        //     extent: vk::Extent2D {
+        //         width: 640,
+        //         height: 480,
+        //     },
+        //     ..Default::default()
+        // });
+        // .clear_values(&clear_value);
 
         unsafe {
             device.cmd_begin_render_pass(*self.raw(), &begin_info, vk::SubpassContents::INLINE)
@@ -1123,41 +1360,39 @@ impl DCommandList {
         };
     }
 
-    pub unsafe fn set_viewport_unchecked(
-        &mut self,
-        position: UVec2,
-        size: UVec2,
-        depth: RangeInclusive<f32>,
-    ) {
-        let device = self.device();
+    pub unsafe fn set_viewport_unchecked(&mut self, viewport: &ViewportState) {
+        let ViewportState {
+            position,
+            extent,
+            depth,
+            scissor,
+        } = viewport;
 
         let viewport = vk::Viewport::builder()
-            .x(position.x as _)
-            .y(position.y as _)
-            .width(size.x as _)
-            .height(size.y as _)
+            .x(position.x)
+            .y(position.y)
+            .width(extent.x)
+            .height(extent.y)
             .min_depth(*depth.start())
             .max_depth(*depth.end())
             .build();
 
-        unsafe { device.cmd_set_viewport(*self.raw(), 0, &[viewport]) };
-    }
+        unsafe { self.device().cmd_set_viewport(*self.raw(), 0, &[viewport]) };
 
-    pub unsafe fn set_scissor_unchecked(&mut self, offset: UVec2, extent: UVec2) {
-        let device = self.device();
+        if let Some(ScissorState { offset, extent }) = scissor {
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: offset.x as _,
+                    y: offset.y as _,
+                },
+                extent: vk::Extent2D {
+                    width: extent.x,
+                    height: extent.y,
+                },
+            };
 
-        let scissor = vk::Rect2D::builder()
-            .offset(vk::Offset2D {
-                x: offset.x as _,
-                y: offset.y as _,
-            })
-            .extent(vk::Extent2D {
-                width: extent.x as _,
-                height: extent.y as _,
-            })
-            .build();
-
-        unsafe { device.cmd_set_scissor(*self.raw(), 0, &[scissor]) };
+            unsafe { self.device().cmd_set_scissor(*self.raw(), 0, &[scissor]) };
+        }
     }
 
     pub unsafe fn draw_unchecked(&mut self, nvertices: usize, ninstances: usize) {
@@ -1203,13 +1438,156 @@ impl Drop for DCommandList {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum AttachmentLoadOp {
-    Load,
-    Clear,
-    #[default]
-    DontCare,
+pub struct Semaphore {
+    semaphore: vk::Semaphore,
+    _device: Arc<DeviceShared>,
 }
+
+impl_try_from_rhi_all!(Vulkan, Semaphore);
+
+impl SemaphoreApi for Semaphore {}
+
+impl Semaphore {
+    pub fn wait(&mut self, value: u64, timeout: Duration) -> Result<bool> {
+        let device = self._device.raw();
+
+        let semaphores = [*self.raw()];
+        let values = [value];
+
+        let wait_info = vk::SemaphoreWaitInfo::builder()
+            .semaphores(&semaphores)
+            .values(&values);
+
+        match unsafe { device.wait_semaphores(&wait_info, timeout.as_nanos() as _) } {
+            Ok(_) => Ok(true),
+            Err(e) if e == vk::Result::TIMEOUT => Ok(false),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    pub fn signal(&mut self, value: u64) -> Result<()> {
+        let device = self._device.raw();
+
+        let signal_info = vk::SemaphoreSignalInfo::builder()
+            .semaphore(*self.raw())
+            .value(value);
+
+        unsafe { device.signal_semaphore(&signal_info) }.map_err(Into::into)
+    }
+
+    pub fn reset(&mut self, value: u64) -> Result<()> {
+        let device = self._device.raw();
+
+        todo!()
+    }
+
+    /// Executes `f` when the value of this semaphore changes.
+    pub fn on_signal(&mut self, f: impl Fn(u64) + 'static) {
+        todo!()
+    }
+
+    /// Executes `f` when the value of this semaphore reaches `value`.
+    pub fn on_value(&mut self, value: u64, f: impl FnOnce() + 'static) {}
+
+    fn raw(&self) -> &vk::Semaphore {
+        &self.semaphore
+    }
+}
+
+impl Drop for Semaphore {
+    fn drop(&mut self) {
+        unsafe { self._device.raw().destroy_semaphore(*self.raw(), None) };
+    }
+}
+
+pub struct Fence {
+    fence: vk::Fence,
+    _device: Arc<DeviceShared>,
+}
+
+impl FenceApi for Fence {
+    fn wait(&self, timeout: Duration) -> Result<bool> {
+        let device = self._device.raw();
+
+        let timeout = timeout.as_nanos() as _;
+        match unsafe { device.wait_for_fences(&[*self.raw()], false, timeout) } {
+            Ok(_) => Ok(true),
+            Err(e) if e == vk::Result::TIMEOUT => Ok(false),
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    fn signaled(&self) -> Result<bool> {
+        let device = self._device.raw();
+        unsafe { device.get_fence_status(*self.raw()) }.map_err(Into::into)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        let device = self._device.raw();
+        unsafe { device.reset_fences(&[*self.raw()]) }.map_err(Into::into)
+    }
+
+    fn leak(mut self) {
+        let device = self._device.raw();
+
+        // If the fence has already been signaled we can just destroy it.
+        if !unsafe { device.get_fence_status(*self.raw()) }.unwrap_or_default() {
+            self.fence = vk::Fence::null();
+        }
+    }
+}
+
+impl Fence {
+    fn raw(&self) -> &vk::Fence {
+        &self.fence
+    }
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        let device = self._device.raw();
+
+        // We don't want to destroy the fence if it has been leaked.
+        if *self.raw() != vk::Fence::null() {
+            // TODO:
+            // We should store the fence together with the device to make sure it is
+            // properly dropped and vulkan doesn't yell at us.
+            //
+            // If the fence has been leaked we could possibly recycle
+            // that fence using a channel.
+            let _ = unsafe { device.wait_for_fences(&[*self.raw()], false, u64::MAX) };
+            unsafe { device.destroy_fence(*self.raw(), None) };
+        }
+    }
+}
+
+impl_try_from_rhi_all!(Vulkan, Fence);
+
+pub struct DImage2D {
+    image: vk::Image,
+    _device: Arc<DeviceShared>,
+}
+
+impl Drop for DImage2D {
+    fn drop(&mut self) {
+        unsafe { self._device.raw().destroy_image(self.image, None) };
+    }
+}
+
+impl_try_from_rhi_all!(Vulkan, DImage2D);
+
+#[derive(Debug, Clone)]
+pub struct DImageView2D {
+    kind: DImageViewKind2D,
+}
+
+#[derive(Debug, Clone)]
+enum DImageViewKind2D {
+    Swapchain(usize, Arc<SwapchainShared>),
+    Owned(vk::ImageView),
+}
+
+impl_try_from_rhi_all!(Vulkan, DImageView2D);
 
 impl From<AttachmentLoadOp> for vk::AttachmentLoadOp {
     fn from(value: AttachmentLoadOp) -> Self {
@@ -1221,13 +1599,6 @@ impl From<AttachmentLoadOp> for vk::AttachmentLoadOp {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum AttachmentStoreOp {
-    Store,
-    #[default]
-    DontCare,
-}
-
 impl From<AttachmentStoreOp> for vk::AttachmentStoreOp {
     fn from(value: AttachmentStoreOp) -> Self {
         match value {
@@ -1235,14 +1606,6 @@ impl From<AttachmentStoreOp> for vk::AttachmentStoreOp {
             AttachmentStoreOp::DontCare => Self::DONT_CARE,
         }
     }
-}
-
-pub struct Attachment {
-    pub format: Format,
-    pub load_op: AttachmentLoadOp,
-    pub store_op: AttachmentStoreOp,
-    pub stencil_load_op: AttachmentLoadOp,
-    pub stencil_store_op: AttachmentStoreOp,
 }
 
 pub struct RenderPassProps<'a> {
@@ -1253,6 +1616,8 @@ pub struct RenderPass {
     render_pass: vk::RenderPass,
     _device: Arc<DeviceShared>,
 }
+
+impl_try_from_rhi_all!(Vulkan, RenderPass);
 
 impl RenderPass {
     pub fn attachment(&self, i: usize) -> Option<Attachment> {
@@ -1270,11 +1635,8 @@ impl RenderPass {
 
 impl Drop for RenderPass {
     fn drop(&mut self) {
-        unsafe {
-            self._device
-                .raw()
-                .destroy_render_pass(self.render_pass, None);
-        }
+        let device = self._device.raw();
+        unsafe { device.destroy_render_pass(self.render_pass, None) }
     }
 }
 
@@ -1282,6 +1644,8 @@ pub struct Framebuffer {
     framebuffer: vk::Framebuffer,
     _device: Arc<DeviceShared>,
 }
+
+impl_try_from_rhi_all!(Vulkan, Framebuffer);
 
 impl Framebuffer {
     fn raw(&self) -> &vk::Framebuffer {
@@ -1302,7 +1666,7 @@ pub struct Shader {
 }
 
 impl Shader {
-    fn raw(&self) -> &vk::ShaderModule {
+    pub fn raw(&self) -> &vk::ShaderModule {
         &self.shader
     }
 }
@@ -1358,155 +1722,36 @@ impl<'a, 'b> AsRef<Self> for PipelineProps<'a, 'b> {
     }
 }
 
-pub struct Pipeline<'a> {
+pub struct Pipeline {
     pipeline: vk::Pipeline,
-    pipeline_layout: vk::PipelineLayout,
+    layout: vk::PipelineLayout,
     _device: Arc<DeviceShared>,
-    _marker: PhantomData<&'a ()>,
 }
 
-impl<'a> Pipeline<'a> {
+impl Pipeline {
     fn raw(&self) -> &vk::Pipeline {
         &self.pipeline
     }
 }
 
-impl<'a> Drop for Pipeline<'a> {
+impl<'a> Drop for Pipeline {
     fn drop(&mut self) {
         let device = self._device.raw();
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_pipeline_layout(self.layout, None);
         };
     }
 }
 
-pub struct Fence {
-    fence: vk::Fence,
-    _device: Arc<DeviceShared>,
-}
-
-impl Fence {
-    pub fn wait(&mut self) -> Result<()> {
-        let device = self._device.raw();
-        unsafe { device.wait_for_fences(&[*self.raw()], true, 16 * 1000 * 1000) }
-            .map_err(Into::into)
-    }
-
-    pub fn reset(&mut self) -> Result<()> {
-        let device = self._device.raw();
-        unsafe { device.reset_fences(&[*self.raw()]) }.map_err(Into::into)
-    }
-
-    pub fn set_callback(&mut self, f: impl Fn() + 'static) {
-        let instance = self._device._instance.raw();
-        let device = self._device.raw();
-
-        #[cfg(target_os = "windows")]
-        {
-            let extension = khr::ExternalFenceWin32::new(instance, device);
-            let get_info = vk::FenceGetWin32HandleInfoKHR::builder()
-                .fence(*self.raw())
-                .handle_type(vk::ExternalFenceHandleTypeFlags::OPAQUE_WIN32);
-
-            let handle = unsafe { extension.get_fence_win32_handle(&get_info) }.unwrap();
-            let handle = HANDLE(handle as _);
-
-            let mut out = HANDLE::default();
-            unsafe {
-                // HACK
-                if RegisterWaitForSingleObject(
-                    &mut out,
-                    handle,
-                    Some(Self::callback_proxy),
-                    None,
-                    INFINITE,
-                    WT_EXECUTEINPERSISTENTTHREAD | WT_EXECUTEONLYONCE,
-                ) == BOOL(0)
-                {
-                    println!("{:?}", unsafe { GetLastError() });
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            todo!()
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    unsafe extern "system" fn callback_proxy(ptr: *mut c_void, _: BOOLEAN) {
-        println!("fired");
-    }
-
-    fn raw(&self) -> &vk::Fence {
-        &self.fence
-    }
-}
-
-impl Drop for Fence {
-    fn drop(&mut self) {
-        unsafe { self._device.raw().destroy_fence(*self.raw(), None) };
-    }
-}
-
-pub struct Semaphore {
-    semaphore: vk::Semaphore,
-    _device: Arc<DeviceShared>,
-}
-
-impl Semaphore {
-    fn raw(&self) -> &vk::Semaphore {
-        &self.semaphore
-    }
-}
-
-impl Drop for Semaphore {
-    fn drop(&mut self) {
-        unsafe { self._device.raw().destroy_semaphore(*self.raw(), None) };
-    }
-}
-
-pub struct DImage {
-    image: Option<vk::Image>,
-    _device: Arc<DeviceShared>,
-}
-
-impl Drop for DImage {
-    fn drop(&mut self) {
-        if let Some(image) = self.image.take() {
-            unsafe { self._device.raw().destroy_image(image, None) };
-        }
-    }
-}
-
-enum DImageViewKind {
-    // Owned(Arc<ImageShared>),
-    Swapchain(usize, Arc<SwapchainShared>),
-}
-
-pub struct DImageView {
-    image_view: vk::ImageView,
-    kind: DImageViewKind,
-    _device: Arc<DeviceShared>,
-}
-
-impl DImageView {
-    fn raw(&self) -> &vk::ImageView {
-        &self.image_view
-    }
-}
-
-impl Drop for DImageView {
-    fn drop(&mut self) {
-        unsafe { self._device.raw().destroy_image_view(*self.raw(), None) };
-    }
-}
+impl_try_from_rhi_all!(Vulkan, Pipeline);
 
 impl From<Format> for vk::Format {
     fn from(value: Format) -> Self {
-        Self::UNDEFINED
+        match value {
+            Format::R8G8B8A8Unorm => Self::R8G8B8A8_UNORM,
+            _ => Self::UNDEFINED,
+        }
         // match value {
         //     Format::Unknown => Self::UNDEFINED,
         //     Format::R8 => todo!(),

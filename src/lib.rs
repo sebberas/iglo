@@ -10,6 +10,7 @@
 #![feature(try_find)]
 #![feature(iterator_try_collect)]
 #![feature(type_alias_impl_trait)]
+#![feature(iter_array_chunks)]
 
 pub mod core;
 pub mod os;

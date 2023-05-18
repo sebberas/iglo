@@ -1,11 +1,12 @@
 use std::os::raw::c_void;
 
-use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::*;
+use ::glam::*;
+use ::windows::core::{HSTRING, PCWSTR};
+use ::windows::Win32::Foundation::*;
+use ::windows::Win32::Graphics::Gdi::*;
+use ::windows::Win32::System::LibraryLoader::*;
+use ::windows::Win32::UI::WindowsAndMessaging::*;
+use ::windows::*;
 
 use crate::os;
 
@@ -128,6 +129,20 @@ impl os::WindowApi for Window {
         };
 
         Ok(Self(window_data))
+    }
+
+    fn extent(&self) -> UVec2 {
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(self.0.hwnd, &mut rect) };
+
+        let RECT {
+            left,
+            top,
+            right,
+            bottom,
+        } = rect;
+
+        uvec2((right - left) as _, (bottom - top) as _)
     }
 
     fn show(&mut self) {

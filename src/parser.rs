@@ -1,17 +1,42 @@
-pub trait Parser<'a> {
-    type Input;
+use std::marker::PhantomData;
+
+pub trait Parser: Sized {
+    type Input: Copy;
     type Output;
 
-    fn parse(&self, input: I) -> Result<Self::Output, ()> {
+    fn parse(&self, input: Self::Input) -> Result<Self::Output, ()> {
         todo!()
+    }
+
+    fn or<P: Parser<Input = Self::Input>>(self, other: P) -> Or<Self, P> {
+        Or(self, other)
+    }
+}
+
+pub struct Or<A, B>(A, B);
+
+impl<I, O, A, B> Parser for Or<A, B>
+where
+    I: Copy,
+    A: Parser<Input = I, Output = O>,
+    B: Parser<Input = I, Output = O>,
+{
+    type Input = I;
+    type Output = O;
+
+    fn parse(&self, input: Self::Input) -> Result<Self::Output, ()> {
+        match self.0.parse(input) {
+            Ok(o) => Ok(o),
+            _ => self.1.parse(input),
+        }
     }
 }
 
 pub struct Literal<I>(I);
 
-impl<I, O> Parser for Literal<I> {
+impl<I: Copy> Parser for Literal<I> {
     type Input = I;
-    type Output = O;
+    type Output = ();
 
     fn parse(&self, input: I) -> Result<Self::Output, ()> {
         todo!()
@@ -32,8 +57,8 @@ mod tests {
         assert!(literal("ABC").parse(ALPHABET).is_ok());
         assert!(literal("XYZ").parse(ALPHABET).is_err());
 
-        const BYTES: &[u8] = [0, 255, 5, 12, 139, 71];
-        assert!(literal([0, 255, 5]).parse(ALPHABET).is_ok());
-        assert!(literal([12, 139, 71]).parse(ALPHABET).is_err());
+        const BYTES: &[u8] = &[0, 255, 5, 12, 139, 71];
+        assert!(literal([0, 255, 5].as_slice()).parse(BYTES).is_ok());
+        assert!(literal([12, 139, 71].as_slice()).parse(BYTES).is_err());
     }
 }
