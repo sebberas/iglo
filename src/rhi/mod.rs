@@ -21,7 +21,7 @@ use std::time::Duration;
 use ::futures::{Future, FutureExt};
 use ::glam::*;
 
-use self::operations::{OperationsError, OperationsType};
+use self::ops::{OperationsError, OperationsType};
 use self::sync::GpuFuture;
 use self::vulkan::{Shader, ShaderStage};
 use crate::os::Window;
@@ -376,11 +376,14 @@ impl Device {
         }
     }
 
-    pub fn new_command_list<O>(&self, pool: &mut CommandPool<O>) -> Result<CommandList<O>, Error>
+    pub fn new_command_list<O>(
+        &self,
+        command_pool: &mut CommandPool<O>,
+    ) -> Result<CommandList<O>, Error>
     where
         O: OperationsType,
     {
-        let dcommand_list = self.new_dcommand_list(pool.as_mut())?;
+        let dcommand_list = self.new_dcommand_list(command_pool.as_mut())?;
         Ok(CommandList(dcommand_list, PhantomData))
     }
 
@@ -400,6 +403,12 @@ impl Device {
     pub fn new_semaphore(&self, value: u64) -> Result<Semaphore, Error> {
         match &self {
             Self::Vulkan(device) => device.new_semaphore(value).map(Into::into),
+        }
+    }
+
+    pub fn new_binary_semaphore(&self) -> Result<BinarySemaphore, Error> {
+        match &self {
+            Self::Vulkan(device) => device.new_binary_semaphore().map(Into::into),
         }
     }
 
@@ -473,7 +482,7 @@ pub enum Operations {
     Transfer,
 }
 
-pub mod operations {
+pub mod ops {
     use super::Operations;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,10 +514,15 @@ pub mod operations {
     }
 }
 
-pub struct SubmitInfo<'a> {
-    pub command_lists: Vec<&'a DCommandList>,
-    pub wait_semaphores: Vec<(&'a Semaphore, u64)>,
-    pub signal_semaphores: Vec<(&'a Semaphore, u64)>,
+pub enum SemaphoreSubmitInfo<'a, S = rhi::Semaphore, B = rhi::BinarySemaphore> {
+    Default(&'a S, u64),
+    Binary(&'a B),
+}
+
+pub struct SubmitInfo<'a, C = rhi::DCommandList, S = rhi::Semaphore, B = rhi::BinarySemaphore> {
+    pub command_lists: Vec<&'a C>,
+    pub wait_semaphores: Vec<SemaphoreSubmitInfo<'a, S, B>>,
+    pub signal_semaphores: Vec<SemaphoreSubmitInfo<'a, S, B>>,
 }
 
 pub enum DQueue {
@@ -541,7 +555,7 @@ impl DQueue {
     // instead.
     pub unsafe fn submit_unchecked<'a>(
         &mut self,
-        infos: impl Iterator<Item = SubmitInfo<'a>>,
+        infos: impl IntoIterator<Item = SubmitInfo<'a>>,
         fence: Option<&mut Fence>,
     ) -> Result<(), Error> {
         match self {
@@ -579,7 +593,7 @@ impl AsMut<DQueue> for DQueue {
     }
 }
 
-pub struct Queue<O: OperationsType>(DQueue, PhantomData<O>);
+pub struct Queue<O: OperationsType = ops::Graphics>(DQueue, PhantomData<O>);
 
 impl<O: OperationsType> Queue<O> {
     /// Creates a new queue where the supported operations are encoded in the
@@ -630,7 +644,7 @@ impl AsMut<DCommandPool> for DCommandPool {
     }
 }
 
-pub struct CommandPool<O: OperationsType>(DCommandPool, PhantomData<O>);
+pub struct CommandPool<O: OperationsType = ops::Graphics>(DCommandPool, PhantomData<O>);
 
 impl<O: OperationsType> AsMut<DCommandPool> for CommandPool<O> {
     fn as_mut(&mut self) -> &mut DCommandPool {
@@ -643,6 +657,25 @@ pub enum DCommandList {
 }
 
 impl DCommandList {
+    /// Resets this command list
+    ///
+    /// # Panics
+    ///
+    /// Panics if `command_pool` is not the same command pool as the one that
+    /// was passed in when creating this command list initially.
+    ///
+    /// # Safety
+    ///
+    /// This command list must not be in the initial or executable state.
+    pub unsafe fn reset_unchecked(&mut self, command_pool: &mut DCommandPool) -> Result<(), Error> {
+        match self {
+            Self::Vulkan(command_list) => {
+                let command_pool: &mut _ = command_pool.try_into().unwrap();
+                command_list.reset_unchecked(command_pool)
+            }
+        }
+    }
+
     /// Begins recording on this command list.
     ///
     /// This sets the internal state of the command list to recording.
@@ -774,7 +807,7 @@ impl DCommandList {
     }
 }
 
-pub struct CommandList<O: OperationsType>(DCommandList, PhantomData<O>);
+pub struct CommandList<O: OperationsType = ops::Graphics>(DCommandList, PhantomData<O>);
 
 impl<O: OperationsType> AsMut<DCommandList> for CommandList<O> {
     fn as_mut(&mut self) -> &mut DCommandList {
@@ -786,6 +819,12 @@ pub trait SemaphoreApi: Send + Sync {}
 
 /// Semaphores are used for synchronizing primarily between device queues, but
 /// also provides mechanisms for blocking on the CPU.
+///
+/// Semaphores can represent a wide range of values depending on the current
+/// state of them.
+///
+/// This semaphore is the most commonly used one, but there also exists a binary
+/// semaphore that can only represent 0 or 1.
 pub enum Semaphore {
     Vulkan(vulkan::Semaphore),
 }
@@ -874,7 +913,7 @@ pub trait FenceApi: Sized + Send + Sync {
     fn on_reset(&mut self, f: impl Fn()) {}
 }
 
-/// **NOTE** Dropping a fence that is still in use by the GPU will cause the
+/// **WARNING** Dropping a fence that is still in use by the GPU will cause the
 /// thread that is dropping the fence to block until the GPU has completed its
 /// operation and signaled the fence.
 pub enum Fence {
@@ -905,6 +944,10 @@ impl FenceApi for Fence {
             Self::Vulkan(fence) => fence.leak(),
         }
     }
+}
+
+pub enum BinarySemaphore {
+    Vulkan(vulkan::BinarySemaphore),
 }
 
 pub enum DImage2D
@@ -1023,7 +1066,10 @@ pub enum Pipeline {
 }
 
 pub enum PresentMode {
-    FIFO,
+    Immediate,
+    Mailbox,
+    Fifo,
+    FifoRelaxed,
 }
 
 pub struct SwapchainProps<'a, D = rhi::Device, S = rhi::Surface> {
@@ -1050,13 +1096,43 @@ impl DSwapchain {
         todo!()
     }
 
-    /// Acquires an image from the swapchain.
-    pub fn image(&self, fence: Fence) -> GpuFuture<View<DImage2D>> {
+    /// Returns an immutable view into a swapchain image.
+    pub unsafe fn image_unchecked(&self, i: usize) -> DImageView2D {
+        match self {
+            Self::Vulkan(swapchain) => swapchain.image_unchecked(i).into(),
+        }
+    }
+
+    pub fn image_mut_unchecked(&self, i: Fence) -> ViewMut<DImage2D> {
         todo!()
     }
 
-    pub fn image_mut(&self, fence: Fence) -> GpuFuture<ViewMut<DImage2D>> {
-        todo!()
+    /// Returns the index of the next available image from the swapchain.
+    ///
+    /// Users should call `image_mut_unchecked` to get a mutable view
+    /// into the image.
+    ///
+    /// It is safe to read from the image while it is still in use by the
+    /// swapchain.
+    ///
+    /// # Safety
+    ///
+    /// It is undefined behaviour to write to the image before `fence` has been
+    /// signaled since it may still be read from by the swapchain.
+    // TODO: Replace usize with an id.
+    pub unsafe fn next_image_i_unchecked(
+        &mut self,
+        semaphore: &mut BinarySemaphore,
+        fence: Option<&mut Fence>,
+        timeout: Duration,
+    ) -> Result<Option<usize>, Error> {
+        match self {
+            Self::Vulkan(swapchain) => {
+                let semaphore = semaphore.try_into().unwrap();
+                let fence = fence.map(|f| f.try_into().unwrap());
+                swapchain.next_image_i_unchecked(semaphore, fence, timeout)
+            }
+        }
     }
 
     /// Acquires an image from the swapchain signaling `fence` when it is no
@@ -1074,19 +1150,19 @@ impl DSwapchain {
     ///
     /// It is undefined behaviour to use the image before `fence` has been
     /// signaled since it may still be read from by the swapchain.
-    pub unsafe fn image_unchecked(
-        &mut self,
-        fence: &mut Fence,
-        timeout: Duration,
-    ) -> Result<Option<DImageView2D>, Error> {
-        match self {
-            Self::Vulkan(swapchain) => {
-                let fence = fence.try_into().unwrap();
-                let image = swapchain.image_unchecked(fence, timeout);
-                image.map(|image| image.map(Into::into))
-            }
-        }
-    }
+    // pub unsafe fn next_image_unchecked(
+    //     &mut self,
+    //     fence: &mut Fence,
+    //     timeout: Duration,
+    // ) -> Result<Option<DImageView2D>, Error> {
+    //     match self {
+    //         Self::Vulkan(swapchain) => {
+    //             let fence = fence.try_into().unwrap();
+    //             let image = swapchain.image_unchecked(fence, timeout);
+    //             image.map(|image| image.map(Into::into))
+    //         }
+    //     }
+    // }
 
     /// Enumerates all the images in the swapchain.
     pub fn enumerate_images(&mut self) -> impl ExactSizeIterator<Item = &DImage2D> + '_ {
@@ -1094,11 +1170,16 @@ impl DSwapchain {
         V.iter()
     }
 
-    pub fn present(&mut self, image_view: &DImageView2D) -> Result<(), Error> {
+    pub fn present<'a>(
+        &mut self,
+        image_view: &DImageView2D,
+        wait_semaphores: impl IntoIterator<Item = &'a mut BinarySemaphore>,
+    ) -> Result<(), Error> {
         match self {
             Self::Vulkan(swapchain) => {
                 let image_view = image_view.try_into().unwrap();
-                swapchain.present(image_view)
+                let wait_semaphores = wait_semaphores.into_iter().map(|s| s.try_into().unwrap());
+                swapchain.present(image_view, wait_semaphores)
             }
         }
     }

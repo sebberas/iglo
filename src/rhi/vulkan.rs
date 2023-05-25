@@ -230,7 +230,10 @@ impl Instance {
         };
 
         let present_mode = match present_mode {
-            PresentMode::FIFO => vk::PresentModeKHR::FIFO,
+            PresentMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
+            PresentMode::Mailbox => vk::PresentModeKHR::MAILBOX,
+            PresentMode::Fifo => vk::PresentModeKHR::FIFO,
+            PresentMode::FifoRelaxed => vk::PresentModeKHR::FIFO_RELAXED,
         };
 
         let extension = khr::Swapchain::new(self.raw(), device.raw());
@@ -584,11 +587,7 @@ impl Adapter {
             }
         }
 
-        QueueFamilyIndices {
-            graphics,
-            compute,
-            transfer,
-        }
+        QueueFamilyIndices { graphics, compute, transfer }
     }
 }
 
@@ -619,7 +618,10 @@ impl DeviceShared {
 
 impl Drop for DeviceShared {
     fn drop(&mut self) {
-        unsafe { self.device.destroy_device(None) };
+        unsafe {
+            let _ = self.raw().device_wait_idle();
+            self.raw().destroy_device(None);
+        }
     }
 }
 
@@ -651,7 +653,7 @@ impl Device {
             .flags(CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
             .queue_family_index(queue.0.family_index as _);
 
-        let pool = unsafe { self.0.raw().create_command_pool(&create_info, None)? };
+        let pool = unsafe { self.raw().create_command_pool(&create_info, None)? };
 
         Ok(DCommandPool(Arc::new(DCommandPoolShared {
             pool,
@@ -659,20 +661,20 @@ impl Device {
         })))
     }
 
-    pub fn new_command_list(&self, pool: &mut DCommandPool) -> Result<DCommandList> {
+    pub fn new_command_list(&self, command_pool: &mut DCommandPool) -> Result<DCommandList> {
         use vk::{CommandBufferAllocateInfo, CommandBufferLevel};
 
         let create_info = CommandBufferAllocateInfo::builder()
-            .command_pool(*pool.0.raw())
+            .command_pool(*command_pool.0.raw())
             .level(CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
 
-        let buffer = unsafe { self.0.raw().allocate_command_buffers(&create_info)? }[0];
+        let buffer = unsafe { self.raw().allocate_command_buffers(&create_info)? }[0];
 
         Ok(DCommandList {
             buffer,
             state: State::Initial,
-            _pool: Arc::clone(&pool.0),
+            _command_pool: Arc::clone(&command_pool.0),
         })
     }
 
@@ -688,6 +690,16 @@ impl Device {
         let semaphore = unsafe { self.0.raw().create_semaphore(&create_info, None)? };
 
         Ok(Semaphore {
+            semaphore,
+            _device: Arc::clone(&self.0),
+        })
+    }
+
+    pub fn new_binary_semaphore(&self) -> Result<BinarySemaphore> {
+        let create_info = vk::SemaphoreCreateInfo::builder();
+        let semaphore = unsafe { self.0.raw().create_semaphore(&create_info, None)? };
+
+        Ok(BinarySemaphore {
             semaphore,
             _device: Arc::clone(&self.0),
         })
@@ -962,12 +974,6 @@ impl Device {
     }
 }
 
-impl Drop for Device {
-    fn drop(&mut self) {
-        let _ = unsafe { self.0.raw().device_wait_idle() };
-    }
-}
-
 struct SwapchainShared {
     extension: khr::Swapchain,
     swapchain: vk::SwapchainKHR,
@@ -1006,19 +1012,27 @@ impl Drop for SwapchainShared {
 pub struct DSwapchain(Arc<SwapchainShared>);
 
 impl DSwapchain {
-    pub unsafe fn image_unchecked(
+    pub unsafe fn next_image_i_unchecked(
         &mut self,
-        fence: &mut Fence,
+        semaphore: &mut BinarySemaphore,
+        fence: Option<&mut Fence>,
         timeout: Duration,
-    ) -> Result<Option<DImageView2D>> {
+    ) -> Result<Option<usize>> {
         let SwapchainShared { extension, .. } = &*self.0;
 
         let device_mask = self.0._device.physical_device_index + 1;
 
+        let fence = if let Some(fence) = fence {
+            *fence.raw()
+        } else {
+            vk::Fence::null()
+        };
+
         let acquire_next_image_info = vk::AcquireNextImageInfoKHR::builder()
             .swapchain(*self.raw())
             .timeout(timeout.as_nanos() as _)
-            .fence(*fence.raw())
+            .semaphore(*semaphore.raw())
+            .fence(fence)
             .device_mask(device_mask as _);
 
         let result = unsafe { extension.acquire_next_image2(&acquire_next_image_info) };
@@ -1026,29 +1040,41 @@ impl DSwapchain {
             return Ok(None);
         }
 
-        let (i, ..) = result?;
-
-        Ok(Some(DImageView2D {
-            kind: DImageViewKind2D::Swapchain(i as _, Arc::clone(&self.0)),
-        }))
+        Ok(Some(result?.0 as _))
     }
 
-    pub fn present(&self, image_view: &DImageView2D) -> Result<()> {
-        let SwapchainShared {
-            extension, _device, ..
-        } = &*self.0;
+    pub unsafe fn image_unchecked(&self, i: usize) -> DImageView2D {
+        let _ = self.0.image_views[i]; // Assert an image exists for this index.
 
-        let swapchain = [*self.raw()];
+        DImageView2D {
+            kind: DImageViewKind2D::Swapchain(i, Arc::clone(&self.0)),
+        }
+    }
 
-        let DImageViewKind2D::Swapchain(i, _) = image_view.kind else {
-            unreachable!();
+    pub fn present<'a>(
+        &self,
+        image_view: &DImageView2D,
+        wait_semaphores: impl IntoIterator<Item = &'a mut BinarySemaphore>,
+    ) -> Result<()> {
+        let SwapchainShared { extension, _device, .. } = &*self.0;
+
+        let wait_semaphores: Vec<_> = wait_semaphores
+            .into_iter()
+            .map(|wait_semaphore| *wait_semaphore.raw())
+            .collect();
+
+        let swapchains = [*self.raw()];
+
+        let image_indices = if let DImageViewKind2D::Swapchain(image_index, _) = image_view.kind {
+            [image_index as _]
+        } else {
+            unreachable!()
         };
 
-        let i = [i as _];
-
         let present_info = vk::PresentInfoKHR::builder()
-            .swapchains(&swapchain)
-            .image_indices(&i);
+            .wait_semaphores(&wait_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
 
         let graphics_index = _device.queue_family_indices.graphics.unwrap();
         let graphics_queue = unsafe { _device.raw().get_device_queue(graphics_index as _, 0) };
@@ -1063,12 +1089,6 @@ impl DSwapchain {
 }
 
 impl_try_from_rhi_all!(Vulkan, DSwapchain);
-
-pub struct SubmitInfo<'a> {
-    command_lists: Vec<&'a DCommandList>,
-    wait_semaphores: Vec<(&'a Semaphore, u64)>,
-    signal_semaphores: Vec<(&'a Semaphore, u64)>,
-}
 
 struct DQueueShared {
     queue: vk::Queue,
@@ -1085,6 +1105,84 @@ impl DQueueShared {
 
 pub struct DQueue(Arc<DQueueShared>);
 
+impl_try_from_rhi_all!(Vulkan, DQueue);
+
+impl DQueue {
+    fn raw(&self) -> &vk::Queue {
+        &self.0.queue
+    }
+
+    fn extract_command_buffers(submit_infos: &[VulkanSubmitInfo]) -> Vec<Vec<vk::CommandBuffer>> {
+        submit_infos
+            .iter()
+            .map(|submit_info| {
+                submit_info
+                    .command_lists
+                    .iter()
+                    .map(|command_list| *command_list.raw())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn extract_wait_semaphores(
+        submit_infos: &[VulkanSubmitInfo],
+    ) -> (Vec<Vec<vk::Semaphore>>, Vec<Vec<u64>>) {
+        let mut semaphores = Vec::with_capacity(4);
+        let mut values = Vec::with_capacity(4);
+
+        for SubmitInfo { wait_semaphores, .. } in submit_infos {
+            let mut inner_semaphores = Vec::with_capacity(4);
+            let mut inner_values = Vec::with_capacity(4);
+
+            for wait_semaphore in wait_semaphores {
+                let (semaphore, value) = match wait_semaphore {
+                    SemaphoreSubmitInfo::Default(semaphore, value) => (*semaphore.raw(), *value),
+                    SemaphoreSubmitInfo::Binary(semaphore) => (*semaphore.raw(), 0),
+                };
+
+                inner_semaphores.push(semaphore);
+                inner_values.push(value);
+            }
+
+            semaphores.push(inner_semaphores);
+            values.push(inner_values);
+        }
+
+        (semaphores, values)
+    }
+
+    fn extract_signal_semaphores(
+        submit_infos: &[VulkanSubmitInfo],
+    ) -> (Vec<Vec<vk::Semaphore>>, Vec<Vec<u64>>) {
+        let mut semaphores = Vec::with_capacity(4);
+        let mut values = Vec::with_capacity(4);
+
+        for SubmitInfo { signal_semaphores, .. } in submit_infos {
+            let mut inner_semaphores = Vec::with_capacity(4);
+            let mut inner_values = Vec::with_capacity(4);
+
+            for signal_semaphore in signal_semaphores {
+                let (semaphore, value) = match signal_semaphore {
+                    SemaphoreSubmitInfo::Default(semaphore, value) => (*semaphore.raw(), *value),
+                    SemaphoreSubmitInfo::Binary(semaphore) => (*semaphore.raw(), 0),
+                };
+
+                inner_semaphores.push(semaphore);
+                inner_values.push(value);
+            }
+
+            semaphores.push(inner_semaphores);
+            values.push(inner_values);
+        }
+
+        (semaphores, values)
+    }
+}
+
+pub type VulkanSubmitInfo<'a> =
+    SubmitInfo<'a, vulkan::DCommandList, vulkan::Semaphore, vulkan::BinarySemaphore>;
+
 impl DQueue {
     pub fn operations(&self) -> Operations {
         self.0.operations
@@ -1093,106 +1191,72 @@ impl DQueue {
     /// # Safety
     pub unsafe fn submit_unchecked(
         &mut self,
-        infos: &[SubmitInfo],
+        submit_infos: &[VulkanSubmitInfo],
         fence: Option<&mut Fence>,
     ) -> Result<()> {
-        let device = &self.0._device.raw();
+        use vk::{PipelineStageFlags, SubmitInfo, TimelineSemaphoreSubmitInfo};
+        let submit_infos_len = submit_infos.len();
 
-        let wait_semaphore_values: Vec<u64> = infos
-            .iter()
-            .flat_map(|info| info.wait_semaphores.iter().map(|(_, value)| *value))
-            .collect();
+        let (wait_semaphores, wait_values) = Self::extract_wait_semaphores(&submit_infos);
+        let command_buffers = Self::extract_command_buffers(&submit_infos);
+        let (signal_semaphores, signal_values) = Self::extract_signal_semaphores(&submit_infos);
 
-        let signal_semaphore_values: Vec<u64> = infos
-            .iter()
-            .flat_map(|info| info.signal_semaphores.iter().map(|(_, value)| *value))
-            .collect();
+        let mut semaphore_submit_infos = Vec::with_capacity(submit_infos.len());
+        for i in 0..submit_infos_len {
+            let semaphore_submit_info = TimelineSemaphoreSubmitInfo::builder()
+                .wait_semaphore_values(&wait_values[i])
+                .signal_semaphore_values(&signal_values[i])
+                .build();
 
-        let mut wait_semaphore_offset = 0;
-        let mut signal_semaphore_offset = 0;
-        let mut timeline_semaphore_submits: Vec<_> = infos
-            .iter()
-            .map(|info| {
-                let wait_values = &wait_semaphore_values
-                    [wait_semaphore_offset..wait_semaphore_offset + info.wait_semaphores.len()];
+            semaphore_submit_infos.push(semaphore_submit_info);
+        }
 
-                let signal_values = &signal_semaphore_values[signal_semaphore_offset
-                    ..signal_semaphore_offset + info.signal_semaphores.len()];
+        let mut submit_infos = Vec::with_capacity(submit_infos_len);
+        for i in 0..submit_infos_len {
+            let submit_info = SubmitInfo::builder()
+                .wait_semaphores(&wait_semaphores[i])
+                .wait_dst_stage_mask(&[PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+                .command_buffers(&command_buffers[i])
+                .signal_semaphores(&signal_semaphores[i])
+                .push_next(&mut semaphore_submit_infos[i])
+                .build();
 
-                wait_semaphore_offset += info.wait_semaphores.len();
-                signal_semaphore_offset += info.signal_semaphores.len();
-
-                vk::TimelineSemaphoreSubmitInfo::builder()
-                    .wait_semaphore_values(wait_values)
-                    .signal_semaphore_values(signal_values)
-                    .build()
-            })
-            .collect();
-
-        let command_buffers: Vec<Vec<_>> = infos
-            .iter()
-            .map(|info| {
-                info.command_lists
-                    .iter()
-                    .map(|command_list| command_list.buffer)
-                    .collect()
-            })
-            .collect();
-
-        let wait_semaphores: Vec<Vec<_>> = infos
-            .iter()
-            .map(|info| {
-                info.wait_semaphores
-                    .iter()
-                    .map(|(semaphore, _)| *semaphore.raw())
-                    .collect()
-            })
-            .collect();
-
-        let signal_semaphores: Vec<Vec<_>> = infos
-            .iter()
-            .map(|info| {
-                info.signal_semaphores
-                    .iter()
-                    .map(|(semaphore, _)| *semaphore.raw())
-                    .collect()
-            })
-            .collect();
-
-        let submits: Vec<_> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                vk::SubmitInfo::builder()
-                    .push_next(&mut timeline_semaphore_submits[i])
-                    .command_buffers(&command_buffers[i])
-                    .wait_semaphores(&wait_semaphores[i])
-                    .signal_semaphores(&signal_semaphores[i])
-                    .build()
-            })
-            .collect();
+            submit_infos.push(submit_info);
+        }
 
         let fence = fence.map(|fence| *fence.raw()).unwrap_or_default();
-        unsafe { device.queue_submit(*self.raw(), &submits, fence) }.map_err(Into::into)
+
+        let device = &self.0._device.raw();
+        unsafe { device.queue_submit(*self.raw(), &submit_infos, fence) }.map_err(Into::into)
     }
 
     pub fn wait_idle(&mut self) -> Result<()> {
         let device = self.0._device.raw();
         unsafe { device.queue_wait_idle(*self.0.raw()) }.map_err(Into::into)
     }
+}
 
-    fn raw(&self) -> &vk::Queue {
-        &self.0.queue
+pub type VulkanSemaphoreSubmitInfo<'a> =
+    SemaphoreSubmitInfo<'a, vulkan::Semaphore, vulkan::BinarySemaphore>;
+
+impl<'a> TryFrom<SemaphoreSubmitInfo<'a>> for VulkanSemaphoreSubmitInfo<'a> {
+    type Error = BackendError;
+
+    fn try_from(value: SemaphoreSubmitInfo<'a>) -> std::result::Result<Self, Self::Error> {
+        use SemaphoreSubmitInfo::*;
+
+        match value {
+            Default(semaphore, value) => Ok(Default(semaphore.try_into()?, value)),
+            Binary(semaphore) => Ok(Binary(semaphore.try_into()?)),
+        }
     }
 }
 
-impl_try_from_rhi_all!(Vulkan, DQueue);
-
-impl<'a> TryFrom<rhi::SubmitInfo<'a>> for SubmitInfo<'a> {
+impl<'a> TryFrom<rhi::SubmitInfo<'a>> for VulkanSubmitInfo<'a> {
     type Error = BackendError;
 
     fn try_from(value: rhi::SubmitInfo<'a>) -> std::result::Result<Self, Self::Error> {
-        let command_lists: Vec<_> = value
+        let command_lists = value
             .command_lists
             .into_iter()
             .map(TryInto::try_into)
@@ -1201,13 +1265,13 @@ impl<'a> TryFrom<rhi::SubmitInfo<'a>> for SubmitInfo<'a> {
         let wait_semaphores: Vec<_> = value
             .wait_semaphores
             .into_iter()
-            .map(|(semaphore, value)| semaphore.try_into().map(|s| (s, value)))
+            .map(TryInto::try_into)
             .collect::<std::result::Result<_, _>>()?;
 
         let signal_semaphores: Vec<_> = value
             .signal_semaphores
             .into_iter()
-            .map(|(semaphore, value)| semaphore.try_into().map(|s| (s, value)))
+            .map(TryInto::try_into)
             .collect::<std::result::Result<_, _>>()?;
 
         Ok(SubmitInfo {
@@ -1232,11 +1296,17 @@ impl DCommandPoolShared {
 impl Drop for DCommandPoolShared {
     fn drop(&mut self) {
         let device = self._queue._device.raw();
-        unsafe { device.destroy_command_pool(*self.raw(), None) };
+        unsafe { device.destroy_command_pool(self.pool, None) };
     }
 }
 
 pub struct DCommandPool(Arc<DCommandPoolShared>);
+
+impl DCommandPool {
+    fn raw(&self) -> &vk::CommandPool {
+        &self.0.pool
+    }
+}
 
 impl_try_from_rhi_all!(Vulkan, DCommandPool);
 
@@ -1256,7 +1326,7 @@ pub enum State {
 pub struct DCommandList {
     buffer: vk::CommandBuffer,
     state: State,
-    _pool: Arc<DCommandPoolShared>,
+    _command_pool: Arc<DCommandPoolShared>,
 }
 
 impl_try_from_rhi_all!(Vulkan, DCommandList);
@@ -1264,12 +1334,20 @@ impl_try_from_rhi_all!(Vulkan, DCommandList);
 impl DCommandList {
     /// Returns the operations supported by this command list
     pub fn operations(&self) -> Operations {
-        self._pool._queue.operations
+        self._command_pool._queue.operations
     }
 
     /// Returns the current state of this command list
     pub fn state(&self) -> State {
         self.state
+    }
+
+    pub unsafe fn reset_unchecked(&mut self, command_pool: &mut DCommandPool) -> Result<()> {
+        assert_eq!(self._command_pool.raw(), command_pool.raw());
+        let device = self.device();
+        device.reset_command_buffer(*self.raw(), vk::CommandBufferResetFlags::empty())?;
+        self.state = State::Initial;
+        Ok(())
     }
 
     /// Begins recording for this command list
@@ -1287,14 +1365,10 @@ impl DCommandList {
     ///   time. This means that until `end_unchecked` is called, the pool
     ///   backing this command list must not begin recording for any of its
     ///   other command lists.
-    pub unsafe fn begin_unchecked(&mut self, pool: &DCommandPool) -> Result<()> {
+    pub unsafe fn begin_unchecked(&mut self, command_pool: &DCommandPool) -> Result<()> {
         use vk::{CommandBufferBeginInfo, CommandBufferInheritanceInfo, CommandBufferUsageFlags};
 
-        assert_eq!(
-            self._pool.raw(),
-            pool.0.raw(),
-            "the pool passed to this function is not the same as the one used to create this command list"
-        );
+        assert_eq!(self._command_pool.raw(), command_pool.raw(),);
 
         let inheritance_info = CommandBufferInheritanceInfo::builder();
 
@@ -1322,19 +1396,14 @@ impl DCommandList {
         let device = self.device();
 
         let clear_value = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 0.0],
-            },
+            color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] },
         }];
 
         let begin_info = vk::RenderPassBeginInfo::builder()
             .render_pass(*render_pass.raw())
             .framebuffer(*framebuffer.raw())
             .render_area(vk::Rect2D {
-                extent: vk::Extent2D {
-                    width: 640,
-                    height: 480,
-                },
+                extent: vk::Extent2D { width: 640, height: 480 },
                 ..Default::default()
             });
         // .render_area(vk::Rect2D {
@@ -1364,12 +1433,7 @@ impl DCommandList {
     }
 
     pub unsafe fn set_viewport_unchecked(&mut self, viewport: &ViewportState) {
-        let ViewportState {
-            position,
-            extent,
-            depth,
-            scissor,
-        } = viewport;
+        let ViewportState { position, extent, depth, scissor } = viewport;
 
         let viewport = vk::Viewport::builder()
             .x(position.x)
@@ -1420,9 +1484,8 @@ impl DCommandList {
     ///
     /// - The command list must be in the recording state.
     pub unsafe fn end_unchecked(&mut self) -> Result<()> {
-        self.device()
-            .end_command_buffer(*self.raw())
-            .map_err(Into::into)
+        self.device().end_command_buffer(*self.raw())?;
+        Ok(())
     }
 
     fn raw(&self) -> &vk::CommandBuffer {
@@ -1430,14 +1493,14 @@ impl DCommandList {
     }
 
     fn device(&self) -> &ash::Device {
-        self._pool._queue._device.raw()
+        self._command_pool._queue._device.raw()
     }
 }
 
 impl Drop for DCommandList {
     fn drop(&mut self) {
-        let device = self._pool._queue._device.raw();
-        unsafe { device.free_command_buffers(*self._pool.raw(), &[self.buffer]) };
+        let device = self._command_pool._queue._device.raw();
+        unsafe { device.free_command_buffers(*self._command_pool.raw(), &[self.buffer]) };
     }
 }
 
@@ -1498,6 +1561,25 @@ impl Semaphore {
 }
 
 impl Drop for Semaphore {
+    fn drop(&mut self) {
+        unsafe { self._device.raw().destroy_semaphore(*self.raw(), None) };
+    }
+}
+
+pub struct BinarySemaphore {
+    semaphore: vk::Semaphore,
+    _device: Arc<DeviceShared>,
+}
+
+impl BinarySemaphore {
+    pub fn raw(&self) -> &vk::Semaphore {
+        &self.semaphore
+    }
+}
+
+impl_try_from_rhi_all!(Vulkan, BinarySemaphore);
+
+impl Drop for BinarySemaphore {
     fn drop(&mut self) {
         unsafe { self._device.raw().destroy_semaphore(*self.raw(), None) };
     }
