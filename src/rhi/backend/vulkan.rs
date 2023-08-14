@@ -1,5 +1,6 @@
 use std::ffi::*;
 use std::mem::ManuallyDrop;
+use std::num::NonZeroUsize;
 use std::ops::{Range, RangeInclusive};
 use std::sync::*;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use ::glam::UVec2;
 use ::windows::Win32::Foundation::*;
 use ::windows::Win32::System::Threading::*;
 use ::windows::Win32::System::WindowsProgramming::*;
-use ash::vk::Viewport;
+use ash::vk::{MemoryType, Viewport};
 
 use crate::rhi::macros::*;
 use crate::rhi::{self, *};
@@ -336,10 +337,7 @@ impl Instance {
             buf
         };
 
-        println!(
-            "{:?}",
-            unsafe { instance.enumerate_physical_devices() }.unwrap()
-        );
+        unsafe { instance.enumerate_physical_devices() }.unwrap();
 
         let physical_device_group = physical_device_groups[0];
 
@@ -348,7 +346,7 @@ impl Instance {
             Vec::from(&physical_device_group.physical_devices[0..len])
         };
 
-        println!("{physical_devices:?}");
+        // println!("{physical_devices:?}");
 
         let is_supported = |physical_device: vk::PhysicalDevice| {
             use vk::{api_version_major, api_version_minor, PhysicalDeviceProperties};
@@ -722,14 +720,6 @@ impl Device {
         })
     }
 
-    pub fn new_image_2d(&self) -> Result<DImage2D> {
-        todo!()
-    }
-
-    pub fn new_image_3d(&self) -> Result<()> {
-        todo!()
-    }
-
     pub fn new_render_pass(&self, attachments: &[Attachment]) -> Result<RenderPass> {
         let attachments: Vec<_> = attachments
             .iter()
@@ -867,9 +857,39 @@ impl Device {
             );
         }
 
+        let vertex_input = state.vertex_input.as_ref().unwrap();
+
+        let vertex_binding_descriptions = vertex_input
+            .bindings
+            .iter()
+            .map(|element| {
+                vk::VertexInputBindingDescription::builder()
+                    .binding(element.binding as _)
+                    .stride(element.stride as _)
+                    .input_rate(match element.rate {
+                        VertexInputRate::Vertex => vk::VertexInputRate::VERTEX,
+                        VertexInputRate::Instance => vk::VertexInputRate::INSTANCE,
+                    })
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
+        let vertex_attribute_descriptions = vertex_input
+            .attributes
+            .iter()
+            .map(|element| {
+                vk::VertexInputAttributeDescription::builder()
+                    .location(element.location as _)
+                    .binding(element.binding as _)
+                    .format(element.format.into())
+                    .offset(element.offset as _)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
-            .vertex_binding_descriptions(&[])
-            .vertex_attribute_descriptions(&[]);
+            .vertex_binding_descriptions(&vertex_binding_descriptions)
+            .vertex_attribute_descriptions(&vertex_attribute_descriptions);
 
         let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -954,16 +974,95 @@ impl Device {
         })
     }
 
-    pub fn wait_idle(&self) -> Result<()> {
-        unsafe { self.0.raw().device_wait_idle() }.map_err(Into::into)
+    pub fn new_descriptor_pool(&self) -> Result<DescriptorPool> {
+        let sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+        }];
+
+        let create_info = vk::DescriptorPoolCreateInfo::builder()
+            .max_sets(16)
+            .pool_sizes(&sizes);
+
+        let descriptor_pool = unsafe { self.raw().create_descriptor_pool(&create_info, None) }?;
+        Ok(DescriptorPool {
+            descriptor_pool,
+            _device: Arc::clone(&self.0),
+        })
     }
 
-    fn raw(&self) -> &ash::Device {
-        &self.0.device
+    pub fn new_buffer(&self, props: &DBufferProps) -> Result<DBuffer> {
+        use vk::{
+            BufferCreateInfo, BufferUsageFlags, MemoryAllocateInfo, MemoryPropertyFlags,
+            SharingMode,
+        };
+
+        let usage = match props.usage {
+            Usage::Uniform => BufferUsageFlags::UNIFORM_BUFFER,
+            Usage::Storage => BufferUsageFlags::STORAGE_BUFFER,
+            Usage::Vertex => BufferUsageFlags::VERTEX_BUFFER,
+            Usage::Index => BufferUsageFlags::INDEX_BUFFER,
+        };
+
+        let buffer_create_info = BufferCreateInfo::builder()
+            .size(props.size.get() as _)
+            .usage(usage | BufferUsageFlags::TRANSFER_SRC | BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(SharingMode::EXCLUSIVE)
+            .queue_family_indices(&[])
+            .build();
+
+        let buffer = unsafe { self.raw().create_buffer(&buffer_create_info, None)? };
+
+        let memory_requirements = unsafe { self.raw().get_buffer_memory_requirements(buffer) };
+
+        let memory_properties = unsafe {
+            self.instance()
+                .get_physical_device_memory_properties(self.0.physical_device)
+        };
+
+        let mut memory_type_index = 0;
+        for i in 0..memory_properties.memory_type_count {
+            let required_memory_property_flags: MemoryPropertyFlags =
+                MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT;
+
+            let MemoryType { property_flags, .. } = &memory_properties.memory_types[i as usize];
+            if property_flags.contains(required_memory_property_flags) {
+                memory_type_index = i;
+                break;
+            }
+        }
+
+        let memory_info = MemoryAllocateInfo::builder()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index)
+            .build();
+
+        let memory = unsafe { self.raw().allocate_memory(&memory_info, None)? };
+
+        unsafe { self.raw().bind_buffer_memory(buffer, memory, 0)? };
+
+        Ok(DBuffer {
+            buffer,
+            size: props.size,
+            memory: Some(memory),
+            _device: Arc::clone(&self.0),
+        })
+    }
+
+    pub fn wait_idle(&self) -> Result<()> {
+        unsafe { self.0.raw().device_wait_idle() }.map_err(Into::into)
     }
 }
 
 impl Device {
+    fn raw(&self) -> &ash::Device {
+        &self.0.device
+    }
+
+    fn instance(&self) -> &ash::Instance {
+        &self.0._instance.raw()
+    }
+
     fn new_pipeline_layout(&self) -> Result<vk::PipelineLayout> {
         let layout_create_info = vk::PipelineLayoutCreateInfo::builder()
             .set_layouts(&[])
@@ -1127,29 +1226,38 @@ impl DQueue {
 
     fn extract_wait_semaphores(
         submit_infos: &[VulkanSubmitInfo],
-    ) -> (Vec<Vec<vk::Semaphore>>, Vec<Vec<u64>>) {
+    ) -> (
+        Vec<Vec<vk::Semaphore>>,
+        Vec<Vec<vk::PipelineStageFlags>>,
+        Vec<Vec<u64>>,
+    ) {
         let mut semaphores = Vec::with_capacity(4);
+        let mut stages = Vec::with_capacity(4);
         let mut values = Vec::with_capacity(4);
 
         for SubmitInfo { wait_semaphores, .. } in submit_infos {
             let mut inner_semaphores = Vec::with_capacity(4);
+            let mut inner_stages: Vec<vk::PipelineStageFlags> = Vec::with_capacity(4);
             let mut inner_values = Vec::with_capacity(4);
 
-            for wait_semaphore in wait_semaphores {
+            for (wait_semaphore, stage) in wait_semaphores {
                 let (semaphore, value) = match wait_semaphore {
                     SemaphoreSubmitInfo::Default(semaphore, value) => (*semaphore.raw(), *value),
                     SemaphoreSubmitInfo::Binary(semaphore) => (*semaphore.raw(), 0),
                 };
 
                 inner_semaphores.push(semaphore);
+                inner_stages.push((*stage).into());
                 inner_values.push(value);
             }
 
             semaphores.push(inner_semaphores);
+            stages.push(inner_stages);
             values.push(inner_values);
         }
 
-        (semaphores, values)
+        // println!("{semaphores:?}");
+        (semaphores, stages, values)
     }
 
     fn extract_signal_semaphores(
@@ -1180,8 +1288,13 @@ impl DQueue {
     }
 }
 
-pub type VulkanSubmitInfo<'a> =
-    SubmitInfo<'a, vulkan::DCommandList, vulkan::Semaphore, vulkan::BinarySemaphore>;
+pub type VulkanSubmitInfo<'a> = SubmitInfo<
+    'a,
+    vulkan::DCommandList,
+    vulkan::Semaphore,
+    vulkan::PipelineStage,
+    vulkan::BinarySemaphore,
+>;
 
 impl DQueue {
     pub fn operations(&self) -> Operations {
@@ -1197,12 +1310,20 @@ impl DQueue {
         use vk::{PipelineStageFlags, SubmitInfo, TimelineSemaphoreSubmitInfo};
         let submit_infos_len = submit_infos.len();
 
-        let (wait_semaphores, wait_values) = Self::extract_wait_semaphores(&submit_infos);
-        let command_buffers = Self::extract_command_buffers(&submit_infos);
-        let (signal_semaphores, signal_values) = Self::extract_signal_semaphores(&submit_infos);
+        let (wait_semaphores, wait_stages, wait_values) =
+            Self::extract_wait_semaphores(submit_infos);
+
+        let command_buffers = Self::extract_command_buffers(submit_infos);
+        let (signal_semaphores, signal_values) = Self::extract_signal_semaphores(submit_infos);
 
         let mut semaphore_submit_infos = Vec::with_capacity(submit_infos.len());
         for i in 0..submit_infos_len {
+            // println!(
+            //     "Timeline Semaphore {:?}: {:?}",
+            //     self.raw(),
+            //     wait_semaphores[i]
+            // );
+
             let semaphore_submit_info = TimelineSemaphoreSubmitInfo::builder()
                 .wait_semaphore_values(&wait_values[i])
                 .signal_semaphore_values(&signal_values[i])
@@ -1215,7 +1336,7 @@ impl DQueue {
         for i in 0..submit_infos_len {
             let submit_info = SubmitInfo::builder()
                 .wait_semaphores(&wait_semaphores[i])
-                .wait_dst_stage_mask(&[PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+                .wait_dst_stage_mask(&wait_stages[i])
                 .command_buffers(&command_buffers[i])
                 .signal_semaphores(&signal_semaphores[i])
                 .push_next(&mut semaphore_submit_infos[i])
@@ -1223,6 +1344,8 @@ impl DQueue {
 
             submit_infos.push(submit_info);
         }
+
+        // println!("{submit_infos:?}");
 
         let fence = fence.map(|fence| *fence.raw()).unwrap_or_default();
 
@@ -1265,7 +1388,7 @@ impl<'a> TryFrom<rhi::SubmitInfo<'a>> for VulkanSubmitInfo<'a> {
         let wait_semaphores: Vec<_> = value
             .wait_semaphores
             .into_iter()
-            .map(TryInto::try_into)
+            .map(|(semaphore, stage)| semaphore.try_into().map(|s| (s, stage)))
             .collect::<std::result::Result<_, _>>()?;
 
         let signal_semaphores: Vec<_> = value
@@ -1279,6 +1402,15 @@ impl<'a> TryFrom<rhi::SubmitInfo<'a>> for VulkanSubmitInfo<'a> {
             wait_semaphores,
             signal_semaphores,
         })
+    }
+}
+
+impl From<rhi::PipelineStage> for vk::PipelineStageFlags {
+    fn from(value: rhi::PipelineStage) -> Self {
+        match value {
+            PipelineStage::Transfer => vk::PipelineStageFlags::TRANSFER,
+            PipelineStage::ColorAttachmentOutput => vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        }
     }
 }
 
@@ -1420,7 +1552,6 @@ impl DCommandList {
         };
     }
 
-    /// # Safety
     pub unsafe fn bind_pipeline_unchecked(&mut self, pipeline: &Pipeline) {
         let device = self.device();
         unsafe {
@@ -1429,6 +1560,19 @@ impl DCommandList {
                 vk::PipelineBindPoint::GRAPHICS,
                 *pipeline.raw(),
             )
+        };
+    }
+
+    pub unsafe fn bind_vertex_buffers_unchecked<'a, I>(&mut self, buffers: I)
+    where
+        I: IntoIterator<Item = &'a DBuffer>,
+    {
+        let buffers: Vec<_> = buffers.into_iter().map(|buffer| *buffer.raw()).collect();
+        let offsets = vec![0; buffers.len()];
+
+        unsafe {
+            self.device()
+                .cmd_bind_vertex_buffers(*self.raw(), 0, &buffers, &offsets)
         };
     }
 
@@ -1486,6 +1630,33 @@ impl DCommandList {
     pub unsafe fn end_unchecked(&mut self) -> Result<()> {
         self.device().end_command_buffer(*self.raw())?;
         Ok(())
+    }
+
+    pub unsafe fn copy_buffer_unchecked(
+        &mut self,
+        _command_pool: &mut DCommandPool,
+        src: &DBuffer,
+        dst: &DBuffer,
+        size: usize,
+    ) {
+        let regions = [vk::BufferCopy::builder()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(size as _)
+            .build()];
+
+        unsafe {
+            self.device()
+                .cmd_copy_buffer(*self.raw(), *src.raw(), *dst.raw(), &regions)
+        }
+    }
+
+    pub unsafe fn copy_image_unchecked(
+        &mut self,
+        command_pool: &mut DCommandPool,
+        src: &DImage2D,
+        dst: &DImage2D,
+    ) {
     }
 
     fn raw(&self) -> &vk::CommandBuffer {
@@ -1831,10 +2002,68 @@ impl<'a> Drop for Pipeline {
 
 impl_try_from_rhi_all!(Vulkan, Pipeline);
 
+pub struct DescriptorPool {
+    descriptor_pool: vk::DescriptorPool,
+    _device: Arc<DeviceShared>,
+}
+
+impl_try_from_rhi_all!(Vulkan, DescriptorPool);
+
+pub struct DescriptorSet {
+    _device: Arc<DeviceShared>,
+}
+
+pub struct DBuffer {
+    buffer: vk::Buffer,
+    size: NonZeroUsize,
+    memory: Option<vk::DeviceMemory>,
+    _device: Arc<DeviceShared>,
+}
+
+impl DBuffer {
+    pub unsafe fn map_unchecked(&self) -> Result<&mut [u8]> {
+        const FLAGS: vk::MemoryMapFlags = vk::MemoryMapFlags::empty();
+
+        let memory = unsafe { self.memory.unwrap_unchecked() };
+        let size: vk::DeviceSize = self.size.get() as _;
+        let data = unsafe { self._device.raw().map_memory(memory, 0, size, FLAGS)? };
+
+        Ok(std::slice::from_raw_parts_mut(
+            data as *mut _,
+            self.size.get(),
+        ))
+    }
+
+    pub unsafe fn unmap_unchecked(&self) {
+        let memory = unsafe { self.memory.unwrap_unchecked() };
+        self._device.raw().unmap_memory(memory);
+    }
+
+    pub fn raw(&self) -> &vk::Buffer {
+        &self.buffer
+    }
+}
+
+impl_try_from_rhi_all!(Vulkan, DBuffer);
+
+impl Drop for DBuffer {
+    fn drop(&mut self) {
+        let device = self._device.raw();
+        if let Some(memory) = self.memory {
+            unsafe { device.free_memory(memory, None) }
+        }
+
+        unsafe { device.destroy_buffer(*self.raw(), None) };
+    }
+}
+
 impl From<Format> for vk::Format {
     fn from(value: Format) -> Self {
         match value {
             Format::R8G8B8A8Unorm => Self::R8G8B8A8_UNORM,
+            Format::R8G8B8A8Srgb => Self::R8G8B8A8_SRGB,
+
+            Format::R32G32B32A32Float => Self::R32G32B32A32_SFLOAT,
             _ => Self::UNDEFINED,
         }
         // match value {

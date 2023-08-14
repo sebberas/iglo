@@ -11,28 +11,44 @@
 //! This behaviour is not documented under a separate panics section for the
 //! individual items since it applies to all functions/methods that takes any of
 //! the backend-agnostic objects as an argument.
+//!
+//! # Example
+//!
+//! ```
+//! let opengl = Instance::new(Backend::OpenGL_460).unwrap();
+//! let adapter = opengl.emumerate_adapters().next().unwrap();
+//!
+//! let vulkan = Instance::new(Backend::Vulkan).unwrap();
+//!
+//!  // Panic with BackendError::Mismatch
+//! let device = vulkan.new_device(DeviceProps {
+//!     adapter: Some(&adapter),
+//!     ..Default::default()
+//! });
+//! ```
 
 use std::borrow::Cow;
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
 use std::ops::{Range, RangeInclusive};
 use std::time::Duration;
 
-use ::futures::{Future, FutureExt};
 use ::glam::*;
 
-use self::ops::{OperationsError, OperationsType};
-use self::sync::GpuFuture;
-use self::vulkan::{Shader, ShaderStage};
+pub use self::backend::*;
+pub use self::queue::*;
+pub use self::resources::*;
+pub use self::swapchain::*;
+use self::vulkan::{Shader, ShaderStage}; // TEMPORARY
 use crate::os::Window;
 use crate::rhi;
 
+pub mod spirv;
 pub mod sync;
 
-// pub mod dx12;
-pub mod vulkan;
-
-pub mod spirv;
+mod backend;
+mod queue;
+mod resources;
+mod swapchain;
 
 mod macros {
     /// Implements [`From`] and [`Into`] for converting away from the
@@ -164,21 +180,6 @@ pub enum Error {
     SurfaceOutdated,
 
     Other(Cow<'static, String>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackendError {
-    Mismatch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Backend {
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    Vulkan,
-    #[cfg(target_os = "windows")]
-    DX12,
-    #[cfg(target_os = "macos")]
-    Metal,
 }
 
 pub enum Instance {
@@ -320,12 +321,19 @@ impl Device {
     ///
     /// Returns the queue if more of the requested type are available. Otherwise
     /// returns None.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Get a graphics queue with the type known at compile-time.
+    /// let queue = device.queue(ops::Graphics).unwrap();
+    /// ```
     pub fn queue<O>(&self, _operations: O) -> Option<Queue<O>>
     where
         O: OperationsType,
     {
         let dqueue = self.dqueue(O::OPERATIONS)?;
-        Some(Queue(dqueue, PhantomData))
+        Some(unsafe { Queue::new_unchecked(dqueue) })
     }
 
     /// Retrieves a queue from the device where the supported operations of that
@@ -359,8 +367,8 @@ impl Device {
     where
         O: OperationsType,
     {
-        let dcommand_pool = self.new_dcommand_pool(queue)?;
-        Ok(CommandPool(dcommand_pool, PhantomData))
+        let command_pool = self.new_dcommand_pool(queue)?;
+        Ok(unsafe { CommandPool::new_unchecked(command_pool) })
     }
 
     /// Creates a new command pool where the supported operations of that
@@ -383,8 +391,8 @@ impl Device {
     where
         O: OperationsType,
     {
-        let dcommand_list = self.new_dcommand_list(command_pool.as_mut())?;
-        Ok(CommandList(dcommand_list, PhantomData))
+        let command_list = self.new_dcommand_list(command_pool.as_mut())?;
+        Ok(unsafe { CommandList::new_unchecked(command_list) })
     }
 
     pub fn new_dcommand_list<P>(&self, pool: &mut P) -> Result<DCommandList, Error>
@@ -466,6 +474,20 @@ impl Device {
         }
     }
 
+    pub fn new_descriptor_pool(&self) -> Result<DescriptorPool, Error> {
+        match self {
+            Self::Vulkan(device) => device.new_descriptor_pool().map(Into::into),
+        }
+    }
+
+    // pub fn new_ddescriptor(&self) -> Result<DDescriptor, Error> {}
+
+    pub fn new_dbuffer(&self, props: &DBufferProps) -> Result<DBuffer, Error> {
+        match self {
+            Self::Vulkan(device) => device.new_buffer(props).map(Into::into),
+        }
+    }
+
     /// Blocks on the current thread until the device has completed all pending
     /// work
     pub fn wait_idle(&self) -> Result<(), Error> {
@@ -519,300 +541,22 @@ pub enum SemaphoreSubmitInfo<'a, S = rhi::Semaphore, B = rhi::BinarySemaphore> {
     Binary(&'a B),
 }
 
-pub struct SubmitInfo<'a, C = rhi::DCommandList, S = rhi::Semaphore, B = rhi::BinarySemaphore> {
+pub struct SubmitInfo<
+    'a,
+    C = rhi::DCommandList,
+    S = rhi::Semaphore,
+    P = rhi::PipelineStage,
+    B = rhi::BinarySemaphore,
+> {
     pub command_lists: Vec<&'a C>,
-    pub wait_semaphores: Vec<SemaphoreSubmitInfo<'a, S, B>>,
+    pub wait_semaphores: Vec<(SemaphoreSubmitInfo<'a, S, B>, P)>,
     pub signal_semaphores: Vec<SemaphoreSubmitInfo<'a, S, B>>,
 }
 
-pub enum DQueue {
-    Vulkan(vulkan::DQueue),
-}
-
-impl DQueue {
-    /// Returns the operations supported by this queue.
-    pub fn operations(&self) -> Operations {
-        match &self {
-            Self::Vulkan(q) => q.operations(),
-        }
-    }
-
-    /// Submits commands to the GPU.
-    ///
-    /// # Safety
-    ///
-    /// It is undefined behaviour to drop any of the the command lists before
-    /// the device is finished executing them.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if one of the `infos` doesn't have any command
-    /// lists attached with it.
-    ///
-    /// This function panics if any of the command lists belong to another
-    /// queue.
-    // TODO Measure overhead of type conversions. Maybe use iterators with generics
-    // instead.
-    pub unsafe fn submit_unchecked<'a>(
-        &mut self,
-        infos: impl IntoIterator<Item = SubmitInfo<'a>>,
-        fence: Option<&mut Fence>,
-    ) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(queue) => {
-                let infos: Vec<_> = infos
-                    .into_iter()
-                    .map(TryInto::try_into)
-                    .collect::<Result<_, _>>()
-                    .unwrap();
-
-                let fence = fence.map(TryInto::try_into).transpose().unwrap();
-                queue.submit_unchecked(infos.as_slice(), fence)
-            }
-        }
-    }
-
-    /// Blocks on the calling-thread until the queue has completed all pending
-    /// work.
-    pub fn wait_idle(&mut self) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(queue) => queue.wait_idle(),
-        }
-    }
-}
-
-impl AsRef<DQueue> for DQueue {
-    fn as_ref(&self) -> &DQueue {
-        self
-    }
-}
-
-impl AsMut<DQueue> for DQueue {
-    fn as_mut(&mut self) -> &mut DQueue {
-        self
-    }
-}
-
-pub struct Queue<O: OperationsType = ops::Graphics>(DQueue, PhantomData<O>);
-
-impl<O: OperationsType> Queue<O> {
-    /// Creates a new queue where the supported operations are encoded in the
-    /// type.
-    pub fn new(dqueue: DQueue) -> Result<Self, OperationsError> {
-        let operations = dqueue.operations();
-        if operations == O::OPERATIONS {
-            Ok(unsafe { Self::new_unchecked(dqueue) })
-        } else {
-            Err(OperationsError {
-                expected: O::OPERATIONS,
-                found: operations,
-            })
-        }
-    }
-
-    /// Creates a new queue that is guaranteed to support `O` operations.
-    ///
-    /// For the safe variant see [`Self::new`].
-    ///
-    /// # Safety
-    /// It is undefined behaviour if `dqueue` doesn't support `O`
-    /// operations.
-    pub unsafe fn new_unchecked(dqueue: DQueue) -> Self {
-        Self(dqueue, PhantomData)
-    }
-}
-
-impl<O: OperationsType> AsRef<DQueue> for Queue<O> {
-    fn as_ref(&self) -> &DQueue {
-        &self.0
-    }
-}
-
-impl<O: OperationsType> AsMut<DQueue> for Queue<O> {
-    fn as_mut(&mut self) -> &mut DQueue {
-        &mut self.0
-    }
-}
-
-pub enum DCommandPool {
-    Vulkan(vulkan::DCommandPool),
-}
-
-impl AsMut<DCommandPool> for DCommandPool {
-    fn as_mut(&mut self) -> &mut DCommandPool {
-        self
-    }
-}
-
-pub struct CommandPool<O: OperationsType = ops::Graphics>(DCommandPool, PhantomData<O>);
-
-impl<O: OperationsType> AsMut<DCommandPool> for CommandPool<O> {
-    fn as_mut(&mut self) -> &mut DCommandPool {
-        &mut self.0
-    }
-}
-
-pub enum DCommandList {
-    Vulkan(vulkan::DCommandList),
-}
-
-impl DCommandList {
-    /// Resets this command list
-    ///
-    /// # Panics
-    ///
-    /// Panics if `command_pool` is not the same command pool as the one that
-    /// was passed in when creating this command list initially.
-    ///
-    /// # Safety
-    ///
-    /// This command list must not be in the initial or executable state.
-    pub unsafe fn reset_unchecked(&mut self, command_pool: &mut DCommandPool) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(command_list) => {
-                let command_pool: &mut _ = command_pool.try_into().unwrap();
-                command_list.reset_unchecked(command_pool)
-            }
-        }
-    }
-
-    /// Begins recording on this command list.
-    ///
-    /// This sets the internal state of the command list to recording.
-    ///
-    /// # Safety
-    ///
-    /// This command list must be in the initial state.
-    ///
-    /// Only a single command list in a pool can be recording at any given
-    /// time. This means that until `end_unchecked` is called, `command_pool`
-    /// must not begin recording for any of its
-    /// other command lists.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `command_pool` is not the command pool as the one that was
-    /// passed in when creating this command list initially.
-    pub unsafe fn begin_unchecked(&mut self, command_pool: &mut DCommandPool) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(command_list) => {
-                let command_pool: &mut _ = command_pool.try_into().unwrap();
-                command_list.begin_unchecked(command_pool)
-            }
-        }
-    }
-
-    /// Ends recording for this command list.
-    ///
-    /// After this has been called it is again safe to use the command pool for
-    /// recording another command list.
-    ///
-    ///  # Safety
-    ///
-    /// It is undefined behaviour if this command list is not in the recording
-    /// state.
-    pub unsafe fn end_unchecked(&mut self) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(command_list) => command_list.end_unchecked(),
-        }
-    }
-
-    /// Begins a render pass on this command list.
-    ///
-    /// # Safety
-    ///
-    /// It is undefined behaviour if any of the following are broken:
-    /// - This command list must support graphics operations and be in the
-    ///   recording state.
-    /// - No other render passes are currently recording meaning you can't call
-    ///   `begin_render_pass_unchecked` two times in a row without calling
-    ///   `end_render_pass_unchecked` in between.
-    pub unsafe fn begin_render_pass_unchecked(
-        &mut self,
-        render_pass: &RenderPass,
-        framebuffer: &mut Framebuffer,
-    ) {
-        match self {
-            Self::Vulkan(command_list) => {
-                let render_pass = render_pass.try_into().unwrap();
-                let framebuffer = framebuffer.try_into().unwrap();
-                command_list.begin_render_pass_unchecked(render_pass, framebuffer);
-            }
-        }
-    }
-
-    /// Ends a render pass on this command list.
-    ///
-    /// After calling this method it is again safe to call
-    /// `begin_render_pass_unchecked`.
-    ///
-    /// # Safety
-    ///
-    /// It is undefined behaviour if any of the following are broken:
-    /// - This command list must support graphics operations and be in the
-    ///   recording state.
-    /// - This command list is not currently recording a render pass.
-    pub unsafe fn end_render_pass_unchecked(&mut self) {
-        match self {
-            Self::Vulkan(command_list) => {
-                command_list.end_render_pass_unchecked();
-            }
-        }
-    }
-
-    /// Binds a pipeline to this command list.
-    ///
-    ///
-    /// # Safety
-    ///
-    /// If `pipeline` is a graphics pipeline, this command list must be
-    /// currently recording a render pass
-    ///
-    /// If `pipeline` is a compute pipeline, this command list must be currently
-    /// recording a compute pass.
-    pub unsafe fn bind_pipeline_unchecked(&mut self, pipeline: &Pipeline) {
-        match self {
-            Self::Vulkan(command_list) => {
-                let pipeline = pipeline.try_into().unwrap();
-                command_list.bind_pipeline_unchecked(pipeline)
-            }
-        }
-    }
-
-    /// Sets the viewport state
-    ///
-    /// # Panics
-    ///
-    /// - Panics if the pipeline doesn't support updating the viewport state
-    ///   dynamically.
-    ///
-    /// # Safety
-    ///
-    /// A pipeline must have been bound
-    pub unsafe fn set_viewport_unchecked(&mut self, viewport: &ViewportState) {
-        match self {
-            Self::Vulkan(command_list) => command_list.set_viewport_unchecked(&viewport),
-        }
-    }
-
-    /// Draw
-    ///
-    /// # Safety
-    ///
-    /// This command list must be recording a render pass.
-    pub unsafe fn draw_unchecked(&mut self, vertices: usize, instances: usize) {
-        match self {
-            Self::Vulkan(command_list) => command_list.draw_unchecked(vertices, instances),
-        }
-    }
-}
-
-pub struct CommandList<O: OperationsType = ops::Graphics>(DCommandList, PhantomData<O>);
-
-impl<O: OperationsType> AsMut<DCommandList> for CommandList<O> {
-    fn as_mut(&mut self) -> &mut DCommandList {
-        &mut self.0
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineStage {
+    Transfer,
+    ColorAttachmentOutput,
 }
 
 pub trait SemaphoreApi: Send + Sync {}
@@ -972,6 +716,8 @@ pub enum RenderPass {
 pub enum Format {
     R8G8B8A8Unorm,
     R8G8B8A8Srgb,
+
+    R32G32B32A32Float,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1016,6 +762,29 @@ pub enum Framebuffer {
     Vulkan(vulkan::Framebuffer),
 }
 
+pub enum VertexInputRate {
+    Vertex,
+    Instance,
+}
+
+pub struct VertexInputBinding {
+    pub binding: usize,
+    pub stride: usize,
+    pub rate: VertexInputRate,
+}
+
+pub struct VertexInputAttribute {
+    pub location: usize,
+    pub binding: usize,
+    pub format: Format,
+    pub offset: usize,
+}
+
+pub struct VertexInputState {
+    pub bindings: Vec<VertexInputBinding>,
+    pub attributes: Vec<VertexInputAttribute>,
+}
+
 pub struct ScissorState {
     pub offset: UVec2,
     pub extent: UVec2,
@@ -1055,6 +824,7 @@ pub struct MultisampleState {
 }
 
 pub struct PipelineState {
+    pub vertex_input: Option<VertexInputState>,
     pub viewport: Option<ViewportState>,
     pub multisample: MultisampleState,
 }
@@ -1065,124 +835,12 @@ pub enum Pipeline {
     Vulkan(vulkan::Pipeline),
 }
 
-pub enum PresentMode {
-    Immediate,
-    Mailbox,
-    Fifo,
-    FifoRelaxed,
+pub enum DescriptorPool {
+    Vulkan(vulkan::DescriptorPool),
 }
 
-pub struct SwapchainProps<'a, D = rhi::Device, S = rhi::Surface> {
-    pub device: &'a D,
-    pub surface: S,
-    pub images: NonZeroUsize,
-    pub image_format: Format,
-    pub image_extent: UVec2,
-    pub present_mode: PresentMode,
-}
-
-pub enum DSwapchain {
-    Vulkan(vulkan::DSwapchain),
-}
-
-impl DSwapchain {
-    /// Returns the format of this swapchain.
-    pub fn format(&self) -> Format {
-        todo!()
-    }
-
-    /// Returns the amount of backbuffers of this swapchain.
-    pub fn backbuffers(&self) -> usize {
-        todo!()
-    }
-
-    /// Returns an immutable view into a swapchain image.
-    pub unsafe fn image_unchecked(&self, i: usize) -> DImageView2D {
-        match self {
-            Self::Vulkan(swapchain) => swapchain.image_unchecked(i).into(),
-        }
-    }
-
-    pub fn image_mut_unchecked(&self, i: Fence) -> ViewMut<DImage2D> {
-        todo!()
-    }
-
-    /// Returns the index of the next available image from the swapchain.
-    ///
-    /// Users should call `image_mut_unchecked` to get a mutable view
-    /// into the image.
-    ///
-    /// It is safe to read from the image while it is still in use by the
-    /// swapchain.
-    ///
-    /// # Safety
-    ///
-    /// It is undefined behaviour to write to the image before `fence` has been
-    /// signaled since it may still be read from by the swapchain.
-    // TODO: Replace usize with an id.
-    pub unsafe fn next_image_i_unchecked(
-        &mut self,
-        semaphore: &mut BinarySemaphore,
-        fence: Option<&mut Fence>,
-        timeout: Duration,
-    ) -> Result<Option<usize>, Error> {
-        match self {
-            Self::Vulkan(swapchain) => {
-                let semaphore = semaphore.try_into().unwrap();
-                let fence = fence.map(|f| f.try_into().unwrap());
-                swapchain.next_image_i_unchecked(semaphore, fence, timeout)
-            }
-        }
-    }
-
-    /// Acquires an image from the swapchain signaling `fence` when it is no
-    /// longer used by the swapchain.
-    ///
-    /// If there is no available image before `timeout` it returns `None`.
-    ///
-    /// This is an unsafe version of [`DSwapchain::image`](DSwapchain).
-    ///
-    /// # Arguments
-    ///
-    /// - `fence` - The fence to signal when the image is available.
-    ///
-    /// # Safety
-    ///
-    /// It is undefined behaviour to use the image before `fence` has been
-    /// signaled since it may still be read from by the swapchain.
-    // pub unsafe fn next_image_unchecked(
-    //     &mut self,
-    //     fence: &mut Fence,
-    //     timeout: Duration,
-    // ) -> Result<Option<DImageView2D>, Error> {
-    //     match self {
-    //         Self::Vulkan(swapchain) => {
-    //             let fence = fence.try_into().unwrap();
-    //             let image = swapchain.image_unchecked(fence, timeout);
-    //             image.map(|image| image.map(Into::into))
-    //         }
-    //     }
-    // }
-
-    /// Enumerates all the images in the swapchain.
-    pub fn enumerate_images(&mut self) -> impl ExactSizeIterator<Item = &DImage2D> + '_ {
-        const V: &[DImage2D] = &[];
-        V.iter()
-    }
-
-    pub fn present<'a>(
-        &mut self,
-        image_view: &DImageView2D,
-        wait_semaphores: impl IntoIterator<Item = &'a mut BinarySemaphore>,
-    ) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(swapchain) => {
-                let image_view = image_view.try_into().unwrap();
-                let wait_semaphores = wait_semaphores.into_iter().map(|s| s.try_into().unwrap());
-                swapchain.present(image_view, wait_semaphores)
-            }
-        }
-    }
+pub enum DescriptorSet {
+    Vulkan(vulkan::DescriptorSet),
 }
 
 pub struct View<T> {
