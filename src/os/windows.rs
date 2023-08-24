@@ -7,6 +7,7 @@ use ::windows::Win32::Graphics::Gdi::*;
 use ::windows::Win32::System::LibraryLoader::*;
 use ::windows::Win32::UI::WindowsAndMessaging::*;
 use ::windows::*;
+use windows::core::w;
 
 use crate::os;
 
@@ -77,7 +78,7 @@ static mut IS_WINDOW_REGISTERED: bool = false;
 impl os::WindowApi for Window {
     fn new(title: &str) -> Result<Self, WindowError> {
         // SAFETY:
-        let hinstance = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap();
+        let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap();
 
         // SAFETY:
         const WINDOW_CLASS_NAME: PCWSTR = w!("iglo_window");
@@ -88,7 +89,7 @@ impl os::WindowApi for Window {
                 lpfnWndProc: Some(WindowData::wndproc_setup),
                 cbClsExtra: 0,
                 cbWndExtra: 0,
-                hInstance: hinstance,
+                hInstance: hmodule.into(),
                 hIcon: HICON::default(),
                 hCursor: HCURSOR::default(),
                 hbrBackground: HBRUSH::default(),
@@ -106,7 +107,7 @@ impl os::WindowApi for Window {
 
         let mut window_data = Box::new(WindowData {
             hwnd: HWND::default(),
-            hinstance,
+            hinstance: hmodule.into(),
             should_close: false,
         });
 
@@ -123,7 +124,7 @@ impl os::WindowApi for Window {
                 CW_USEDEFAULT,
                 HWND::default(),
                 HMENU::default(),
-                hinstance,
+                HINSTANCE::from(hmodule),
                 Some(window_data.as_mut() as *mut _ as *mut c_void),
             )
         };
@@ -135,12 +136,7 @@ impl os::WindowApi for Window {
         let mut rect = RECT::default();
         unsafe { GetClientRect(self.0.hwnd, &mut rect) };
 
-        let RECT {
-            left,
-            top,
-            right,
-            bottom,
-        } = rect;
+        let RECT { left, top, right, bottom } = rect;
 
         uvec2((right - left) as _, (bottom - top) as _)
     }
@@ -149,12 +145,7 @@ impl os::WindowApi for Window {
         let mut rect = RECT::default();
         unsafe { GetWindowRect(self.0.hwnd, &mut rect) };
 
-        let RECT {
-            left,
-            top,
-            right,
-            bottom,
-        } = rect;
+        let RECT { left, top, right, bottom } = rect;
 
         uvec2((right - left) as _, (bottom - top) as _)
     }

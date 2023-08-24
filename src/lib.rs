@@ -6,7 +6,6 @@
 #![feature(trivial_bounds)]
 #![feature(nonzero_min_max)]
 #![feature(generic_arg_infer)]
-#![feature(option_result_contains)]
 #![feature(try_find)]
 #![feature(iterator_try_collect)]
 #![feature(type_alias_impl_trait)]
