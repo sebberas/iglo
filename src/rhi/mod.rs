@@ -14,13 +14,13 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```should_panic
 //! let opengl = Instance::new(Backend::OpenGL_460).unwrap();
 //! let adapter = opengl.emumerate_adapters().next().unwrap();
 //!
 //! let vulkan = Instance::new(Backend::Vulkan).unwrap();
 //!
-//!  // Panic with BackendError::Mismatch
+//! // Panics with BackendError::Mismatch
 //! let device = vulkan.new_device(DeviceProps {
 //!     adapter: Some(&adapter),
 //!     ..Default::default()
@@ -29,26 +29,32 @@
 
 use std::borrow::Cow;
 use std::marker::PhantomData;
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 use std::time::Duration;
 
 use ::glam::*;
 
 pub use self::backend::*;
+pub use self::descriptor::*;
+pub use self::format::Format;
+pub use self::pipeline::*;
 pub use self::queue::*;
 pub use self::resources::*;
 pub use self::swapchain::*;
-use self::vulkan::{Shader, ShaderStage}; // TEMPORARY
+pub use self::sync::*;
+use self::vulkan::ShaderStage; // TEMPORARY
 use crate::os::Window;
 use crate::rhi;
 
 pub mod spirv;
-pub mod sync;
 
 mod backend;
+mod descriptor;
+mod pipeline;
 mod queue;
 mod resources;
 mod swapchain;
+mod sync;
 
 mod macros {
     /// Implements [`From`] and [`Into`] for converting away from the
@@ -458,27 +464,26 @@ impl Device {
     }
 
     /// Creates a new pipeline
-    pub fn new_pipeline(
-        &self,
-        state: &PipelineState,
-        shaders: &[(Shader, ShaderStage)],
-        render_pass: &RenderPass,
-    ) -> Result<Pipeline, Error> {
+    pub fn new_pipeline(&self, props: PipelineProps) -> Result<Pipeline, Error> {
         match self {
             Self::Vulkan(device) => {
-                let render_pass = render_pass.try_into().unwrap();
-                device
-                    .new_pipeline(state, shaders, render_pass)
-                    .map(Into::into)
+                let props = props.try_into().unwrap();
+                device.new_pipeline(props).map(Into::into)
             }
         }
     }
 
-    pub fn new_descriptor_pool(&self) -> Result<DescriptorPool, Error> {
-        match self {
-            Self::Vulkan(device) => device.new_descriptor_pool().map(Into::into),
-        }
-    }
+    // pub fn new_descriptor_pool(&self) -> Result<DescriptorPool, Error> {
+    //     match self {
+    //         Self::Vulkan(device) => device.new_descriptor_pool().map(Into::into),
+    //     }
+    // }
+
+    // pub fn new_descriptor_set(&self) -> Result<DescriptorSet, Error> {
+    //     match self {
+    //         Self::Vulkan(device) => device.new_descriptor_pool().map(Into::into),
+    //     }
+    // }
 
     // pub fn new_ddescriptor(&self) -> Result<DDescriptor, Error> {}
 
@@ -494,45 +499,6 @@ impl Device {
         match self {
             Self::Vulkan(device) => device.wait_idle(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Operations {
-    Graphics,
-    Compute,
-    Transfer,
-}
-
-pub mod ops {
-    use super::Operations;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct OperationsError {
-        pub expected: Operations,
-        pub found: Operations,
-    }
-
-    pub trait OperationsType {
-        const OPERATIONS: Operations;
-    }
-
-    /// Supports all operations.
-    pub struct Graphics;
-    impl OperationsType for Graphics {
-        const OPERATIONS: Operations = Operations::Graphics;
-    }
-
-    /// Supports compute and transfer operations.
-    pub struct Compute;
-    impl OperationsType for Compute {
-        const OPERATIONS: Operations = Operations::Compute;
-    }
-
-    /// Supports transfer operations.
-    pub struct Transfer;
-    impl OperationsType for Transfer {
-        const OPERATIONS: Operations = Operations::Transfer;
     }
 }
 
@@ -559,141 +525,6 @@ pub enum PipelineStage {
     ColorAttachmentOutput,
 }
 
-pub trait SemaphoreApi: Send + Sync {}
-
-/// Semaphores are used for synchronizing primarily between device queues, but
-/// also provides mechanisms for blocking on the CPU.
-///
-/// Semaphores can represent a wide range of values depending on the current
-/// state of them.
-///
-/// This semaphore is the most commonly used one, but there also exists a binary
-/// semaphore that can only represent 0 or 1.
-pub enum Semaphore {
-    Vulkan(vulkan::Semaphore),
-}
-
-impl Semaphore {
-    /// Waits until the semaphore has reached `value` or until `timeout` has
-    /// elapsed.
-    ///
-    /// # Returns
-    ///
-    /// Returns true if this semaphore reached `value` before the timeout.
-    ///
-    /// # Platform Specific
-    /// - **Vulkan:** Timeouts longer than 584.55 years are clamped down.
-    pub fn wait(&mut self, value: u64, timeout: Duration) -> Result<bool, Error> {
-        match self {
-            Self::Vulkan(e) => e.wait(value, timeout),
-        }
-    }
-
-    /// Sets the value of this semaphore to `value`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `value` is less than the current value.
-    pub fn signal(&mut self, value: u64) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(e) => e.signal(value),
-        }
-    }
-
-    /// Resets the value of this semaphore to `value`.
-    pub fn reset(&mut self, value: u64) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(e) => e.reset(value),
-        }
-    }
-
-    /// Executes `f` when the value of this semaphore changes.
-    pub fn on_signal(&mut self, f: impl Fn(u64) + 'static) {
-        match self {
-            Self::Vulkan(e) => e.on_signal(f),
-        }
-    }
-
-    /// Executes `f` when the value of this semaphore reaches `value`.
-    pub fn on_value(&mut self, value: u64, f: impl FnOnce() + 'static) {
-        match self {
-            Self::Vulkan(e) => e.on_value(value, f),
-        }
-    }
-}
-
-impl SemaphoreApi for Semaphore {}
-
-pub trait FenceApi: Sized + Send + Sync {
-    /// Waits until this fence has been signaled or until `timeout`
-    /// has elapsed.
-    /// # Returns
-    ///
-    /// Returns true if this semaphore reached `value` before the timeout.
-    ///
-    /// # Platform Specific
-    /// - **Vulkan:** Timeouts longer than 584.55 years are clamped down.
-    fn wait(&self, timeout: Duration) -> Result<bool, Error>;
-
-    /// Returns whether this fence is in a signaled state.
-    fn signaled(&self) -> Result<bool, Error>;
-
-    /// Resets this fence back to being unsignaled.
-    fn reset(&mut self) -> Result<(), Error>;
-
-    /// Leaks the internal fence handle without waiting on the CPU.
-    ///
-    /// If the fence is already signaled no memory leak will occur and the fence
-    /// will be destroyed correctly.
-    ///
-    /// This means that the handle will never be returned to the API essentially
-    /// causing a memory leak in the Driver/GPU.
-    fn leak(self);
-
-    /// Attaches a callback to the fence that is executed when it is signaled.
-    fn on_signal(&mut self, f: impl Fn()) {}
-
-    /// Attaches a callback to the fence that is executed when it is reset.
-    fn on_reset(&mut self, f: impl Fn()) {}
-}
-
-/// **WARNING** Dropping a fence that is still in use by the GPU will cause the
-/// thread that is dropping the fence to block until the GPU has completed its
-/// operation and signaled the fence.
-pub enum Fence {
-    Vulkan(vulkan::Fence),
-}
-
-impl FenceApi for Fence {
-    fn wait(&self, timeout: Duration) -> Result<bool, Error> {
-        match self {
-            Self::Vulkan(fence) => fence.wait(timeout),
-        }
-    }
-
-    fn signaled(&self) -> Result<bool, Error> {
-        match self {
-            Self::Vulkan(fence) => fence.signaled(),
-        }
-    }
-
-    fn reset(&mut self) -> Result<(), Error> {
-        match self {
-            Self::Vulkan(fence) => fence.reset(),
-        }
-    }
-
-    fn leak(self) {
-        match self {
-            Self::Vulkan(fence) => fence.leak(),
-        }
-    }
-}
-
-pub enum BinarySemaphore {
-    Vulkan(vulkan::BinarySemaphore),
-}
-
 pub enum DImage2D
 where
     Self: Send + Sync,
@@ -712,12 +543,110 @@ pub enum RenderPass {
     Vulkan(vulkan::RenderPass),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    R8G8B8A8Unorm,
-    R8G8B8A8Srgb,
+pub enum Shader {
+    Vulkan(vulkan::Shader),
+}
 
-    R32G32B32A32Float,
+pub mod format {
+    macro_rules! generate_formats {
+        ($vis:vis enum $enum:ident { $($inner:ident,)* }) => {
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            $vis enum $enum {
+                $($inner,)*
+            }
+
+            $(
+                $vis struct $inner;
+                impl FormatType for $inner {
+                    const FORMAT: $enum = $enum::$inner;
+                }
+            )*
+
+        };
+    }
+
+    // TODO: Make this trait sealed.
+    pub trait FormatType {
+        const FORMAT: Format;
+    }
+
+    generate_formats! {
+        pub enum Format {
+            Unknown,
+
+            R8,
+            R8Unorm,
+            R8Snorm,
+            R8Uint,
+            R8Sint,
+
+            R16,
+            R16Unorm,
+            R16Snorm,
+            R16Uint,
+            R16Sint,
+            R16Float,
+
+            D16Unorm,
+
+            R32,
+            R32Uint,
+            R32Sint,
+            R32Float,
+
+            D32Float,
+
+            R8G8,
+            R8G8Unorm,
+            R8G8Snorm,
+            R8G8Uint,
+            R8G8Sint,
+
+            R16G16,
+            R16G16Unorm,
+            R16G16Snorm,
+            R16G16Uint,
+            R16G16Sint,
+            R16G16Float,
+
+            D24UnormS8Uint,
+
+            R32G32,
+            R32G32Uint,
+            R32G32Sint,
+            R32G32Float,
+
+            R11G11B10Float,
+
+            R32G32B32,
+            R32G32B32Uint,
+            R32G32B32Sint,
+            R32G32B32Float,
+
+            R8G8B8A8,
+            R8G8B8A8Unorm,
+            R8G8B8A8Snorm,
+            R8G8B8A8Uint,
+            R8G8B8A8Sint,
+            R8G8B8A8Srgb,
+
+            R10G10B10A2,
+            R10G10B10A2Unorm,
+            R10G10B10A2Uint,
+
+            R16G16B16A16,
+            R16G16B16A16Unorm,
+            R16G16B16A16Snorm,
+            R16G16B16A16Uint,
+            R16G16B16A16Sint,
+            R16G16B16A16Float,
+
+            R32G32B32A32,
+            R32G32B32A32Uint,
+            R32G32B32A32Sint,
+            R32G32B32A32Float,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -760,87 +689,6 @@ pub enum Attachment {
 
 pub enum Framebuffer {
     Vulkan(vulkan::Framebuffer),
-}
-
-pub enum VertexInputRate {
-    Vertex,
-    Instance,
-}
-
-pub struct VertexInputBinding {
-    pub binding: usize,
-    pub stride: usize,
-    pub rate: VertexInputRate,
-}
-
-pub struct VertexInputAttribute {
-    pub location: usize,
-    pub binding: usize,
-    pub format: Format,
-    pub offset: usize,
-}
-
-pub struct VertexInputState {
-    pub bindings: Vec<VertexInputBinding>,
-    pub attributes: Vec<VertexInputAttribute>,
-}
-
-pub struct ScissorState {
-    pub offset: UVec2,
-    pub extent: UVec2,
-}
-
-pub struct ViewportState {
-    pub position: Vec2,
-    pub extent: Vec2,
-    pub depth: RangeInclusive<f32>,
-    pub scissor: Option<ScissorState>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Samples(usize);
-
-impl Samples {
-    pub const ONE: Samples = Samples(1);
-    pub const TWO: Samples = Samples(2);
-    pub const FOUR: Samples = Samples(4);
-
-    pub fn new(count: usize) -> Option<Samples> {
-        match count {
-            1 | 2 | 4 | 16 | 32 | 64 => Some(Self(count)),
-            _ => None,
-        }
-    }
-}
-
-impl Default for Samples {
-    fn default() -> Self {
-        Self::ONE
-    }
-}
-
-pub struct MultisampleState {
-    pub samples: Samples,
-}
-
-pub struct PipelineState {
-    pub vertex_input: Option<VertexInputState>,
-    pub viewport: Option<ViewportState>,
-    pub multisample: MultisampleState,
-}
-
-pub struct PipelineProps {}
-
-pub enum Pipeline {
-    Vulkan(vulkan::Pipeline),
-}
-
-pub enum DescriptorPool {
-    Vulkan(vulkan::DescriptorPool),
-}
-
-pub enum DescriptorSet {
-    Vulkan(vulkan::DescriptorSet),
 }
 
 pub struct View<T> {

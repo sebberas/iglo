@@ -10,6 +10,8 @@ pub enum BackendError {
     Mismatch,
 }
 
+pub type BackendResult<T> = std::result::Result<T, BackendError>;
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Backend {
@@ -23,7 +25,7 @@ pub enum Backend {
     OpenGl460,
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     OpenGl330,
-    #[cfg(any(target_os = "windows"))]
+    #[cfg(target_os = "windows")]
     DX11,
 }
 
@@ -42,7 +44,7 @@ impl Display for Backend {
             OpenGl460 => f.write_str("OpenGL 4.60"),
             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             OpenGl330 => f.write_str("OpenGL 3.30"),
-            #[cfg(any(target_os = "windows"))]
+            #[cfg(target_os = "windows")]
             DX11 => f.write_str("DirectX 11"),
         }
     }

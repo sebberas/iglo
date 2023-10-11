@@ -10,6 +10,7 @@ cmake = "0.1.49"
 ash = { version = "0.37", features = ["linked"] }
 bitflags = "2.4"
 byteorder = "1.4"
+combine = "4.6.6"
 futures = { version = "0.3", features = ["thread-pool"] }
 glam = "0.24"
 tracing = "0.1"

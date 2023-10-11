@@ -10,9 +10,13 @@
 #![feature(iterator_try_collect)]
 #![feature(type_alias_impl_trait)]
 #![feature(iter_array_chunks)]
+#![feature(trait_alias)]
+#![feature(let_chains)]
+#![feature(portable_simd)]
 
 pub mod core;
 pub mod os;
 // pub mod renderer;
-pub mod parser;
 pub mod rhi;
+
+pub mod wasm;

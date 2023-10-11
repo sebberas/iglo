@@ -1,6 +1,45 @@
-pub use self::ops::{OperationsError, OperationsType};
+pub(crate) use self::ops::{OperationsError, OperationsType};
 use crate::rhi::backend::*;
 use crate::rhi::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operations {
+    Graphics,
+    Compute,
+    Transfer,
+}
+
+pub mod ops {
+    use super::Operations;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OperationsError {
+        pub expected: Operations,
+        pub found: Operations,
+    }
+
+    pub trait OperationsType {
+        const OPERATIONS: Operations;
+    }
+
+    /// Supports all operations.
+    pub struct Graphics;
+    impl OperationsType for Graphics {
+        const OPERATIONS: Operations = Operations::Graphics;
+    }
+
+    /// Supports compute and transfer operations.
+    pub struct Compute;
+    impl OperationsType for Compute {
+        const OPERATIONS: Operations = Operations::Compute;
+    }
+
+    /// Supports transfer operations.
+    pub struct Transfer;
+    impl OperationsType for Transfer {
+        const OPERATIONS: Operations = Operations::Transfer;
+    }
+}
 
 pub enum DQueue {
     Vulkan(vulkan::DQueue),
@@ -198,12 +237,14 @@ impl DCommandList {
     ///
     /// # Safety
     ///
-    /// This command list must be in the initial state.
+    /// - This command list must be in the initial state.
     ///
-    /// Only a single command list in a pool can be recording at any given
+    /// - Only a single command list in a pool can be recording at any given
     /// time. This means that until `end_unchecked` is called, `command_pool`
     /// must not begin recording for any of its
     /// other command lists.
+    ///
+    ///
     ///
     /// # Panics
     ///
@@ -306,6 +347,30 @@ impl DCommandList {
             Self::Vulkan(command_list) => {
                 let buffers = buffers.into_iter().map(|buffer| buffer.try_into().unwrap());
                 command_list.bind_vertex_buffers_unchecked(buffers);
+            }
+        }
+    }
+
+    /// Binds descriptor sets to this command list.
+    ///
+    /// # Safety
+    ///
+    /// `pipeline` must be the currently bound pipeline.
+    pub unsafe fn bind_descriptor_sets_unchecked<'a, I>(
+        &mut self,
+        pipeline: &Pipeline,
+        descriptor_sets: I,
+    ) where
+        I: IntoIterator<Item = &'a DDescriptorSet>,
+    {
+        match self {
+            Self::Vulkan(command_list) => {
+                let pipeline = pipeline.try_into().unwrap();
+                let descriptor_sets = descriptor_sets
+                    .into_iter()
+                    .map(|sets| sets.try_into().unwrap());
+
+                command_list.bind_descriptor_sets_unchecked(pipeline, descriptor_sets);
             }
         }
     }

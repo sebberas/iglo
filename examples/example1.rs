@@ -45,6 +45,9 @@ struct Renderer {
     uniform_buffer: DBuffer,
     transfer_semaphore: BinarySemaphore,
 
+    descriptor_pool: DescriptorPool,
+    descriptor_set: DDescriptorSet,
+
     swapchain: DSwapchain,
 
     synchronization: Vec<(BinarySemaphore, BinarySemaphore, Fence)>,
@@ -110,7 +113,10 @@ impl Renderer {
         unsafe { (data.as_mut_ptr() as *mut Mat4).copy_from(matrices.as_ptr(), 3) };
         unsafe { uniform_buffer.unmap_unchecked() };
 
-        let descriptor_pool = device.new_descriptor_pool().unwrap();
+        let mut descriptor_pool = device.new_descriptor_pool(&DescriptorPoolProps {}).unwrap();
+        let mut descriptor_set = device.new_ddescriptor_set(&mut descriptor_pool).unwrap();
+
+        unsafe { descriptor_set.insert_unchecked(0, &uniform_buffer) };
 
         Self {
             device,
@@ -123,6 +129,9 @@ impl Renderer {
             vertex_buffer,
             uniform_buffer,
             transfer_semaphore,
+
+            descriptor_pool,
+            descriptor_set,
 
             framebuffers,
             synchronization,
@@ -160,6 +169,7 @@ impl Renderer {
             );
 
             dcommand_list.bind_pipeline_unchecked(&self.pipeline);
+            dcommand_list.bind_descriptor_sets_unchecked(&self.pipeline, [&self.descriptor_set]);
 
             dcommand_list.bind_vertex_buffers_unchecked([&self.vertex_buffer]);
 
@@ -271,38 +281,73 @@ impl Renderer {
         let vertex_shader = device.new_shader(Self::VERTEX_SHADER_CODE).unwrap();
         let pixel_shader = device.new_shader(Self::PIXEL_SHADER_CODE).unwrap();
 
-        let shaders = [
-            (vertex_shader, ShaderStage::Vertex),
-            (pixel_shader, ShaderStage::Pixel),
-        ];
+        // let shaders = [
+        //     (vertex_shader, ShaderStage::Vertex),
+        //     (pixel_shader, ShaderStage::Pixel),
+        // ];
 
-        let state = PipelineState {
-            vertex_input: Some(VertexInputState {
-                bindings: vec![VertexInputBinding {
-                    binding: 0,
-                    stride: std::mem::size_of::<(Vec4, Vec4)>(),
-                    rate: VertexInputRate::Vertex,
-                }],
-                attributes: vec![
-                    VertexInputAttribute {
-                        location: 0,
+        // let state = PipelineState {
+        //     vertex_input: Some(VertexInputState {
+        //         bindings: vec![VertexInputBinding {
+        //             binding: 0,
+        //             stride: std::mem::size_of::<(Vec4, Vec4)>(),
+        //             rate: VertexInputRate::Vertex,
+        //         }],
+        //         attributes: vec![
+        //             VertexInputAttribute {
+        //                 location: 0,
+        //                 binding: 0,
+        //                 format: Format::R32G32B32A32Float,
+        //                 offset: 0,
+        //             },
+        //             VertexInputAttribute {
+        //                 location: 1,
+        //                 binding: 0,
+        //                 format: Format::R32G32B32A32Float,
+        //                 offset: std::mem::size_of::<Vec4>(),
+        //             },
+        //         ],
+        //     }),
+        //     viewport: None,
+        //     multisample: MultisampleState { samples: Samples::ONE },
+        // };
+
+        let pipeline_props = PipelineProps {
+            shaders: PipelineShaders {
+                vertex: Some(&vertex_shader),
+                pixel: Some(&pixel_shader),
+                ..Default::default()
+            },
+            sets: Vec::default(),
+            state: &PipelineState {
+                vertex_input: Some(VertexInputState {
+                    bindings: vec![VertexInputBinding {
                         binding: 0,
-                        format: Format::R32G32B32A32Float,
-                        offset: 0,
-                    },
-                    VertexInputAttribute {
-                        location: 1,
-                        binding: 0,
-                        format: Format::R32G32B32A32Float,
-                        offset: std::mem::size_of::<Vec4>(),
-                    },
-                ],
-            }),
-            viewport: None,
-            multisample: MultisampleState { samples: Samples::ONE },
+                        stride: std::mem::size_of::<(Vec4, Vec4)>(),
+                        rate: VertexInputRate::Vertex,
+                    }],
+                    attributes: vec![
+                        VertexInputAttribute {
+                            location: 0,
+                            binding: 0,
+                            format: Format::R32G32B32A32Float,
+                            offset: 0,
+                        },
+                        VertexInputAttribute {
+                            location: 1,
+                            binding: 0,
+                            format: Format::R32G32B32A32Float,
+                            offset: std::mem::size_of::<Vec4>(),
+                        },
+                    ],
+                }),
+                viewport: None,
+                multisample: MultisampleState { samples: Samples::ONE },
+            },
+            render_pass,
         };
 
-        device.new_pipeline(&state, &shaders, render_pass).unwrap()
+        device.new_pipeline(pipeline_props).unwrap()
     }
 
     fn setup_staging_buffer(device: &Device) -> DBuffer {

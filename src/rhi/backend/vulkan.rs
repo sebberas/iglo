@@ -829,149 +829,147 @@ impl Device {
         })
     }
 
-    pub fn new_pipeline(
-        &self,
-        state: &PipelineState,
-        shaders: &[(Shader, ShaderStage)],
-        render_pass: &RenderPass,
-    ) -> Result<Pipeline> {
+    pub fn new_pipeline(&self, props: VulkanPipelineProps) -> Result<Pipeline> {
         const ENTRYPOINT: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
 
         let layout = self.new_pipeline_layout()?;
 
-        let mut stages = vec![];
+        // let mut stages = vec![];
 
-        for (shader, stage) in shaders {
-            let stage = match stage {
-                ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
-                ShaderStage::Pixel => vk::ShaderStageFlags::FRAGMENT,
-                _ => todo!(),
-            };
+        // for (shader, stage) in shaders {
+        //     let stage = match stage {
+        //         ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
+        //         ShaderStage::Pixel => vk::ShaderStageFlags::FRAGMENT,
+        //         _ => todo!(),
+        //     };
 
-            stages.push(
-                vk::PipelineShaderStageCreateInfo::builder()
-                    .stage(stage)
-                    .module(*shader.raw())
-                    .name(ENTRYPOINT)
-                    .build(),
-            );
-        }
+        //     stages.push(
+        //         vk::PipelineShaderStageCreateInfo::builder()
+        //             .stage(stage)
+        //             .module(*shader.raw())
+        //             .name(ENTRYPOINT)
+        //             .build(),
+        //     );
+        // }
 
-        let vertex_input = state.vertex_input.as_ref().unwrap();
+        // let vertex_input = state.vertex_input.as_ref().unwrap();
 
-        let vertex_binding_descriptions = vertex_input
-            .bindings
-            .iter()
-            .map(|element| {
-                vk::VertexInputBindingDescription::builder()
-                    .binding(element.binding as _)
-                    .stride(element.stride as _)
-                    .input_rate(match element.rate {
-                        VertexInputRate::Vertex => vk::VertexInputRate::VERTEX,
-                        VertexInputRate::Instance => vk::VertexInputRate::INSTANCE,
-                    })
-                    .build()
-            })
-            .collect::<Vec<_>>();
+        // let vertex_binding_descriptions = vertex_input
+        //     .bindings
+        //     .iter()
+        //     .map(|element| {
+        //         vk::VertexInputBindingDescription::builder()
+        //             .binding(element.binding as _)
+        //             .stride(element.stride as _)
+        //             .input_rate(match element.rate {
+        //                 VertexInputRate::Vertex => vk::VertexInputRate::VERTEX,
+        //                 VertexInputRate::Instance => vk::VertexInputRate::INSTANCE,
+        //             })
+        //             .build()
+        //     })
+        //     .collect::<Vec<_>>();
 
-        let vertex_attribute_descriptions = vertex_input
-            .attributes
-            .iter()
-            .map(|element| {
-                vk::VertexInputAttributeDescription::builder()
-                    .location(element.location as _)
-                    .binding(element.binding as _)
-                    .format(element.format.into())
-                    .offset(element.offset as _)
-                    .build()
-            })
-            .collect::<Vec<_>>();
+        // let vertex_attribute_descriptions = vertex_input
+        //     .attributes
+        //     .iter()
+        //     .map(|element| {
+        //         vk::VertexInputAttributeDescription::builder()
+        //             .location(element.location as _)
+        //             .binding(element.binding as _)
+        //             .format(element.format.into())
+        //             .offset(element.offset as _)
+        //             .build()
+        //     })
+        //     .collect::<Vec<_>>();
 
-        let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
-            .vertex_binding_descriptions(&vertex_binding_descriptions)
-            .vertex_attribute_descriptions(&vertex_attribute_descriptions);
+        // let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
+        //     .vertex_binding_descriptions(&vertex_binding_descriptions)
+        //     .vertex_attribute_descriptions(&vertex_attribute_descriptions);
 
-        let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(false);
+        // let input_assembly_state =
+        // vk::PipelineInputAssemblyStateCreateInfo::builder()
+        //     .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        //     .primitive_restart_enable(false);
 
-        let viewports = [vk::Viewport::builder()
-            .x(0.0)
-            .y(0.0)
-            .width(1200.0)
-            .height(800.0)
-            .min_depth(0.0)
-            .max_depth(1.0)
-            .build()];
+        // let viewports = [vk::Viewport::builder()
+        //     .x(0.0)
+        //     .y(0.0)
+        //     .width(1200.0)
+        //     .height(800.0)
+        //     .min_depth(0.0)
+        //     .max_depth(1.0)
+        //     .build()];
 
-        let scissors = [vk::Rect2D::default()];
+        // let scissors = [vk::Rect2D::default()];
 
-        let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-            .viewports(&viewports)
-            .scissors(&scissors);
+        // let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        //     .viewports(&viewports)
+        //     .scissors(&scissors);
 
-        let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
-            .depth_clamp_enable(false)
-            .rasterizer_discard_enable(false)
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::CLOCKWISE)
-            .depth_bias_enable(false)
-            .depth_bias_constant_factor(0.0)
-            .depth_bias_clamp(0.0)
-            .depth_bias_slope_factor(0.0)
-            .line_width(1.0);
+        // let rasterization_state = vk::PipelineRasterizationStateCreateInfo::builder()
+        //     .depth_clamp_enable(false)
+        //     .rasterizer_discard_enable(false)
+        //     .polygon_mode(vk::PolygonMode::FILL)
+        //     .cull_mode(vk::CullModeFlags::BACK)
+        //     .front_face(vk::FrontFace::CLOCKWISE)
+        //     .depth_bias_enable(false)
+        //     .depth_bias_constant_factor(0.0)
+        //     .depth_bias_clamp(0.0)
+        //     .depth_bias_slope_factor(0.0)
+        //     .line_width(1.0);
 
-        let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
+        //     .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-        let attachments = [vk::PipelineColorBlendAttachmentState::builder()
-            .blend_enable(false)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ZERO)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .build()];
+        // let attachments = [vk::PipelineColorBlendAttachmentState::builder()
+        //     .blend_enable(false)
+        //     .src_color_blend_factor(vk::BlendFactor::ONE)
+        //     .dst_color_blend_factor(vk::BlendFactor::ZERO)
+        //     .color_blend_op(vk::BlendOp::ADD)
+        //     .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        //     .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        //     .alpha_blend_op(vk::BlendOp::ADD)
+        //     .color_write_mask(vk::ColorComponentFlags::RGBA)
+        //     .build()];
 
-        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
-            .logic_op_enable(false)
-            .logic_op(vk::LogicOp::COPY)
-            .attachments(&attachments)
-            .blend_constants([0.0, 0.0, 0.0, 0.0]);
+        // let color_blend_state = vk::PipelineColorBlendStateCreateInfo::builder()
+        //     .logic_op_enable(false)
+        //     .logic_op(vk::LogicOp::COPY)
+        //     .attachments(&attachments)
+        //     .blend_constants([0.0, 0.0, 0.0, 0.0]);
 
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
+        // let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
+        //     .dynamic_states(&[vk::DynamicState::VIEWPORT,
+        // vk::DynamicState::SCISSOR]);
 
-        let create_info = vk::GraphicsPipelineCreateInfo::builder()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input_state)
-            .input_assembly_state(&input_assembly_state)
-            // .tessellation_state(tessellation_state)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization_state)
-            .multisample_state(&multisample_state)
-            // .depth_stencil_state(depth_stencil_state)
-            .color_blend_state(&color_blend_state)
-            .dynamic_state(&dynamic_state)
-            .layout(layout)
-            .render_pass(*render_pass.raw())
-            .subpass(0)
-            .build();
+        // let create_info = vk::GraphicsPipelineCreateInfo::builder()
+        //     .stages(&stages)
+        //     .vertex_input_state(&vertex_input_state)
+        //     .input_assembly_state(&input_assembly_state)
+        //     // .tessellation_state(tessellation_state)
+        //     .viewport_state(&viewport_state)
+        //     .rasterization_state(&rasterization_state)
+        //     .multisample_state(&multisample_state)
+        //     // .depth_stencil_state(depth_stencil_state)
+        //     .color_blend_state(&color_blend_state)
+        //     .dynamic_state(&dynamic_state)
+        //     .layout(layout)
+        //     .render_pass(*render_pass.raw())
+        //     .subpass(0)
+        //     .build();
 
-        let pipeline = unsafe {
-            self.raw()
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
-                .unwrap()[0]
-        };
+        // let pipeline = unsafe {
+        //     self.raw()
+        //         .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info],
+        // None)         .unwrap()[0]
+        // };
 
-        Ok(Pipeline {
-            pipeline,
-            layout,
-            _device: Arc::clone(&self.0),
-        })
+        // Ok(Pipeline {
+        //     pipeline,
+        //     layout,
+        //     _device: Arc::clone(&self.0),
+        // })
+        todo!()
     }
 
     pub fn new_descriptor_pool(&self) -> Result<DescriptorPool> {
@@ -987,6 +985,42 @@ impl Device {
         let descriptor_pool = unsafe { self.raw().create_descriptor_pool(&create_info, None) }?;
         Ok(DescriptorPool {
             descriptor_pool,
+            _device: Arc::clone(&self.0),
+        })
+    }
+
+    pub fn new_descriptor_set(&self, pool: &mut DescriptorPool) -> Result<DDescriptorSet> {
+        let descriptor_set_layout = unsafe {
+            self.raw().create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo {
+                    binding_count: 1,
+                    p_bindings: [vk::DescriptorSetLayoutBinding {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 1,
+                        stage_flags: vk::ShaderStageFlags::ALL,
+                        p_immutable_samplers: std::ptr::null(),
+                        ..Default::default()
+                    }]
+                    .as_ptr(),
+                    ..Default::default()
+                },
+                None,
+            )?
+        };
+
+        let descriptor_sets = unsafe {
+            self.raw()
+                .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo {
+                    descriptor_pool: *pool.raw(),
+                    descriptor_set_count: 1,
+                    p_set_layouts: [descriptor_set_layout].as_ptr(),
+                    ..Default::default()
+                })?
+        };
+
+        Ok(DDescriptorSet {
+            descriptor_set: descriptor_sets[0],
             _device: Arc::clone(&self.0),
         })
     }
@@ -1563,6 +1597,30 @@ impl DCommandList {
         };
     }
 
+    pub unsafe fn bind_descriptor_sets_unchecked<'a, I>(
+        &mut self,
+        pipeline: &Pipeline,
+        descriptor_sets: I,
+    ) where
+        I: IntoIterator<Item = &'a DDescriptorSet>,
+    {
+        let descriptor_sets: Vec<_> = descriptor_sets
+            .into_iter()
+            .map(|descriptor_set| *descriptor_set.raw())
+            .collect();
+
+        {
+            self.device().cmd_bind_descriptor_sets(
+                *self.raw(),
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.layout,
+                0,
+                &descriptor_sets,
+                &[],
+            )
+        }
+    }
+
     pub unsafe fn bind_vertex_buffers_unchecked<'a, I>(&mut self, buffers: I)
     where
         I: IntoIterator<Item = &'a DBuffer>,
@@ -1921,6 +1979,8 @@ pub struct Shader {
     _device: Arc<DeviceShared>,
 }
 
+impl_try_from_rhi_all!(Vulkan, Shader);
+
 impl Shader {
     pub fn raw(&self) -> &vk::ShaderModule {
         &self.shader
@@ -1958,23 +2018,76 @@ impl From<ShaderStage> for vk::ShaderStageFlags {
     }
 }
 
-pub struct PipelineShaderStage<'a, 'b> {
-    pub stage: ShaderStage,
-    pub shader: &'a Shader,
-    pub entrypoint: &'b str,
+// pub struct PipelineShaderStage<'a, 'b> {
+//     pub stage: ShaderStage,
+//     pub shader: &'a Shader,
+//     pub entrypoint: &'b str,
+// }
+
+// pub struct PipelineLayout {}
+
+// pub struct PipelineProps<'a, 'b> {
+//     pub stages: &'b [PipelineShaderStage<'a, 'b>],
+//     pub render_pass: &'b RenderPass,
+//     pub layout: PipelineLayout,
+// }
+
+// impl<'a, 'b> AsRef<Self> for PipelineProps<'a, 'b> {
+//     fn as_ref(&self) -> &Self {
+//         self
+//     }
+// }
+
+pub type VulkanPipelineShaders<'a> = PipelineShaders<'a, Shader>;
+
+impl<'a> TryFrom<PipelineShaders<'a>> for VulkanPipelineShaders<'a> {
+    type Error = BackendError;
+    fn try_from(value: PipelineShaders<'a>) -> BackendResult<Self> {
+        let PipelineShaders {
+            vertex,
+            tessellation_control,
+            tessellation_evalution,
+            geometry,
+            pixel,
+            compute,
+        } = value;
+
+        Ok(Self {
+            vertex: vertex.map(|s| s.try_into()).transpose()?,
+            tessellation_control: tessellation_control.map(|s| s.try_into()).transpose()?,
+            tessellation_evalution: tessellation_evalution.map(|s| s.try_into()).transpose()?,
+            geometry: geometry.map(|s| s.try_into()).transpose()?,
+            pixel: pixel.map(|s| s.try_into()).transpose()?,
+            compute: compute.map(|s| s.try_into()).transpose()?,
+        })
+    }
 }
 
-pub struct PipelineLayout {}
+pub type VulkanPipelineProps<'a> = PipelineProps<'a, Shader, DDescriptorSetLayout, RenderPass>;
 
-pub struct PipelineProps<'a, 'b> {
-    pub stages: &'b [PipelineShaderStage<'a, 'b>],
-    pub render_pass: &'b RenderPass,
-    pub layout: PipelineLayout,
-}
+impl<'a> TryFrom<PipelineProps<'a>> for VulkanPipelineProps<'a> {
+    type Error = BackendError;
+    fn try_from(value: PipelineProps<'a>) -> BackendResult<Self> {
+        let PipelineProps {
+            shaders,
+            sets,
+            state,
+            render_pass,
+        } = value;
 
-impl<'a, 'b> AsRef<Self> for PipelineProps<'a, 'b> {
-    fn as_ref(&self) -> &Self {
-        self
+        Ok(Self {
+            shaders: shaders.try_into()?,
+            sets: {
+                let sets: Vec<&DDescriptorSetLayout> = sets
+                    .into_iter()
+                    .map(|set| set.try_into())
+                    .collect::<BackendResult<_>>()?;
+            
+                sets
+            },
+            state,
+            render_pass: render_pass.try_into()?,
+        })
     }
 }
 
@@ -2007,11 +2120,55 @@ pub struct DescriptorPool {
     _device: Arc<DeviceShared>,
 }
 
+impl DescriptorPool {
+    pub fn raw(&self) -> &vk::DescriptorPool {
+        &self.descriptor_pool
+    }
+}
+
 impl_try_from_rhi_all!(Vulkan, DescriptorPool);
 
-pub struct DescriptorSet {
+pub struct DDescriptorSetLayout {}
+
+impl_try_from_rhi_all!(Vulkan, DDescriptorSetLayout);
+
+pub struct DDescriptorSet {
+    descriptor_set: vk::DescriptorSet,
     _device: Arc<DeviceShared>,
 }
+
+impl DDescriptorSet {
+    pub unsafe fn insert_unchecked(&mut self, binding: usize, buffer: &DBuffer) {
+        self.device().update_descriptor_sets(
+            &[vk::WriteDescriptorSet {
+                dst_set: *self.raw(),
+                dst_binding: binding as _,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                p_buffer_info: &vk::DescriptorBufferInfo {
+                    buffer: *buffer.raw(),
+                    offset: 0,
+                    range: buffer.size.get() as _,
+                },
+                ..Default::default()
+            }],
+            &[],
+        );
+    }
+}
+
+impl DDescriptorSet {
+    pub fn raw(&self) -> &vk::DescriptorSet {
+        &self.descriptor_set
+    }
+
+    fn device(&self) -> &ash::Device {
+        self._device.raw()
+    }
+}
+
+impl_try_from_rhi_all!(Vulkan, DDescriptorSet);
 
 pub struct DBuffer {
     buffer: vk::Buffer,
