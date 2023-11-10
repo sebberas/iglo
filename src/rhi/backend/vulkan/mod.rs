@@ -2107,21 +2107,25 @@ impl QueueFamilyAllocator {
                         SurfaceImp::Xcb { mut connection, xid } => {
                             use ::xcb::{Xid};
 
-                            instance.xcb_surface_extension().get_physical_device_xcb_presentation_support(
+                            let supported = instance.xcb_surface_extension().get_physical_device_xcb_presentation_support(
                                 physical_device,
                                 i as _,
                                 std::mem::transmute(&mut connection),
                                 xid.resource_id()
                             );
+
+                            println!("{supported}");
                         }
                     }
                 }
 
             let Range { start, end } = requirements.graphics_queues.clone().unwrap_or(1..5);
             if queue_flags.contains(QueueFlags::GRAPHICS | QueueFlags::COMPUTE) {
-                    unsafe {
-                        instance.surface_extension().get_physical_device_surface_support(physical_device, i as _, *surface.raw()).unwrap()
+                    let result = unsafe {
+                        instance.surface_extension().get_physical_device_surface_support(physical_device, i as _, *surface.raw())
                     };
+
+                    println!("{result:?}");
                 }
 
                 if set.graphics.is_none() && start >= *queue_count as _ {
