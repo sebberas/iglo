@@ -157,8 +157,7 @@ mod macros {
     }
 
     pub(super) use {
-        impl_into_rhi, impl_try_from_rhi, impl_try_from_rhi_all, impl_try_from_rhi_mut,
-        impl_try_from_rhi_ref,
+        impl_into_rhi, impl_try_from_rhi, impl_try_from_rhi_all, impl_try_from_rhi_mut, impl_try_from_rhi_ref,
     };
 }
 
@@ -182,6 +181,7 @@ pub enum Error {
     Other(Cow<'static, String>),
 }
 
+#[non_exhaustive]
 pub enum Instance {
     Vulkan(vulkan::Instance),
 }
@@ -210,7 +210,8 @@ impl Instance {
         }
     }
 
-    /// Returns what backend this instance is running.
+    // TODO: Macroify
+    /// Returns what backend this instance is using.
     pub fn backend(&self) -> Backend {
         match self {
             Self::Vulkan(_) => Backend::Vulkan,
@@ -223,9 +224,9 @@ impl Instance {
     /// The instance creation is guaranteed to fail if no adapters are
     /// available which means that the returned iterator will never be empty and
     /// at least contain one element.
-    pub fn enumerate_adapters(&self) -> impl Iterator<Item = Adapter> + '_ {
+    pub fn iter_adapters(&self) -> impl Iterator<Item = Adapter> + '_ {
         match &self {
-            Self::Vulkan(i) => i.enumerate_adapters().map(Adapter::Vulkan),
+            Self::Vulkan(instance) => instance.iter_adapters().map(Adapter::Vulkan),
         }
     }
 
@@ -247,18 +248,9 @@ impl Instance {
     ///
     /// - This function will panic if both an adapter and a surface is supplied
     /// and the adapter doesn't support presentation to the surface.
-    ///
-    /// - Panics if [`DeviceProps::adapter`](DeviceProps) or
-    ///   [`DeviceProps::surface`] in [DeviceProps] is not using the same
-    ///   backend as the
-    /// instance.
-    pub fn new_device(&self, mut props: DeviceProps) -> Result<Device, Error> {
+    pub fn new_device(&self, props: DeviceProps) -> Result<Device, Error> {
         match &self {
-            Self::Vulkan(i) => {
-                let surface = props.surface.take().map(|e| e.try_into().unwrap());
-                let adapter = props.adapter.take().map(|e| e.try_into().unwrap());
-                i.new_device(surface, adapter, props).map(Into::into)
-            }
+            Self::Vulkan(instance) => instance.new_device(props.try_into().unwrap()).map(Device::Vulkan),
         }
     }
 
@@ -283,21 +275,77 @@ impl Instance {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdapterKind {
+    Discrete,
+    Integrated,
+    Virtual,
+    Unknown,
+}
+
+pub struct AdapterFeatures {}
+
+pub struct AdapterMemory {}
+
+#[non_exhaustive]
 pub enum Adapter {
     Vulkan(vulkan::Adapter),
 }
 
-pub enum Surface {
-    Vulkan(vulkan::Surface),
+impl Adapter {
+    // TODO: Macroify
+    /// Returns what backend this adapter is using.
+    pub fn backend(&self) -> Backend {
+        match self {
+            Self::Vulkan(_) => Backend::Vulkan,
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        match &self {
+            Self::Vulkan(adapter) => adapter.id(),
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match &self {
+            Self::Vulkan(adapter) => adapter.name(),
+        }
+    }
+
+    pub fn kind(&self) -> AdapterKind {
+        match &self {
+            Self::Vulkan(adapter) => adapter.kind(),
+        }
+    }
+
+    pub fn features(&self) -> AdapterFeatures {
+        AdapterFeatures {}
+    }
+
+    pub fn memory(&self) -> AdapterMemory {
+        AdapterMemory {}
+    }
 }
 
-#[derive(Default)]
-pub struct DeviceProps<'a> {
-    pub adapter: Option<Adapter>,
-    pub surface: Option<&'a Surface>,
+pub struct DeviceProps<'a, A = Adapter, S = Surface> {
+    pub adapter: Option<A>,
+    pub surface: Option<&'a S>,
     pub graphics_queues: Option<Range<usize>>,
-    pub compute_queues: Option<Range<usize>>,
-    pub transfer_queues: Option<Range<usize>>,
+    pub compute_queues: (Option<Range<usize>>, bool),
+    pub transfer_queues: (Option<Range<usize>>, bool),
+}
+
+impl<'a, A, S> Default for DeviceProps<'a, A, S> {
+    fn default() -> Self {
+        Self {
+            adapter: None,
+            surface: None,
+            graphics_queues: None,
+            compute_queues: (None, false),
+            transfer_queues: (None, false),
+        }
+    }
 }
 
 pub enum Device {
@@ -384,10 +432,7 @@ impl Device {
         }
     }
 
-    pub fn new_command_list<O>(
-        &self,
-        command_pool: &mut CommandPool<O>,
-    ) -> Result<CommandList<O>, Error>
+    pub fn new_command_list<O>(&self, command_pool: &mut CommandPool<O>) -> Result<CommandList<O>, Error>
     where
         O: OperationsType,
     {
@@ -444,9 +489,7 @@ impl Device {
                 let render_pass = render_pass.try_into().unwrap();
                 let attachments = attachments.iter().map(|a| a.try_into().unwrap());
 
-                device
-                    .new_framebuffer(render_pass, attachments, extent)
-                    .map(Into::into)
+                device.new_framebuffer(render_pass, attachments, extent).map(Into::into)
             }
         }
     }
@@ -467,9 +510,7 @@ impl Device {
         match self {
             Self::Vulkan(device) => {
                 let render_pass = render_pass.try_into().unwrap();
-                device
-                    .new_pipeline(state, shaders, render_pass)
-                    .map(Into::into)
+                device.new_pipeline(state, shaders, render_pass).map(Into::into)
             }
         }
     }
@@ -541,13 +582,7 @@ pub enum SemaphoreSubmitInfo<'a, S = rhi::Semaphore, B = rhi::BinarySemaphore> {
     Binary(&'a B),
 }
 
-pub struct SubmitInfo<
-    'a,
-    C = rhi::DCommandList,
-    S = rhi::Semaphore,
-    P = rhi::PipelineStage,
-    B = rhi::BinarySemaphore,
-> {
+pub struct SubmitInfo<'a, C = rhi::DCommandList, S = rhi::Semaphore, P = rhi::PipelineStage, B = rhi::BinarySemaphore> {
     pub command_lists: Vec<&'a C>,
     pub wait_semaphores: Vec<(SemaphoreSubmitInfo<'a, S, B>, P)>,
     pub signal_semaphores: Vec<SemaphoreSubmitInfo<'a, S, B>>,

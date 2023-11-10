@@ -10,6 +10,9 @@
 #![feature(iterator_try_collect)]
 #![feature(type_alias_impl_trait)]
 #![feature(iter_array_chunks)]
+#![feature(return_position_impl_trait_in_trait)]
+#![feature(lazy_cell)]
+#![feature(let_chains)]
 
 pub mod core;
 pub mod os;

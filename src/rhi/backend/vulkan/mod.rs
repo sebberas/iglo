@@ -1,18 +1,17 @@
 use std::ffi::*;
-use std::mem::ManuallyDrop;
+use std::fmt::{Debug, Formatter};
+use std::hint::unreachable_unchecked;
 use std::num::NonZeroUsize;
 use std::ops::{Range, RangeInclusive};
 use std::sync::*;
 use std::time::Duration;
 
 use ::ash::extensions::*;
+use ::ash::vk::{MemoryType, Viewport};
 use ::ash::{vk, Entry};
 use ::glam::UVec2;
 #[cfg(target_os = "windows")]
 use ::windows::Win32::Foundation::*;
-use ::windows::Win32::System::Threading::*;
-use ::windows::Win32::System::WindowsProgramming::*;
-use ash::vk::{MemoryType, Viewport};
 
 use crate::rhi::macros::*;
 use crate::rhi::{self, *};
@@ -41,9 +40,6 @@ impl From<vk::Result> for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-const VALIDATION_LAYER_NAME: &CStr =
-    unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") };
-
 struct InstanceShared {
     entry: Entry,
     instance: ash::Instance,
@@ -54,9 +50,39 @@ impl InstanceShared {
     fn raw(&self) -> &ash::Instance {
         &self.instance
     }
+
+    unsafe extern "system" fn debug_callback(severity: vk::DebugUtilsMessageSeverityFlagsEXT, kind: vk::DebugUtilsMessageTypeFlagsEXT, data: *const vk::DebugUtilsMessengerCallbackDataEXT, _: *mut c_void) -> u32 {
+        let severity = match severity {
+            vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => "VERBOSE",
+            vk::DebugUtilsMessageSeverityFlagsEXT::INFO => "INFO",
+            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => "WARNING",
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => "ERROR",
+            _ => unreachable!()
+        };
+
+        let s = CStr::from_ptr((*data).p_message);
+        let s = CString::from(s);
+
+        println!("[VULKAN/{severity}] {}", s.to_str().unwrap());
+        vk::FALSE
+    }
+
+    fn surface_extension(&self) -> khr::Surface {
+        khr::Surface::new(&self.entry, self.raw())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn xcb_surface_extension(&self) -> khr::XcbSurface {
+        khr::XcbSurface::new(&self.entry, self.raw())
+    }
+    
+    #[cfg(target_os = "windows")]
+    fn win32_surface_extension(&self) -> khr::Win32Surface {
+        khr::Win32Surface::new(&self.entry, self.raw())
+    }
 }
 
-impl std::fmt::Debug for InstanceShared {
+impl Debug for InstanceShared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstanceShared")
             .field("physical_devices", &self.physical_devices)
@@ -74,9 +100,30 @@ impl Instance {
 
 impl Instance {
     const ENGINE_NAME: &'static CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"iglo\0") };
+    const VALIDATION_NAME: &'static CStr =
+        unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") };
 
     pub fn new(debug: bool) -> Result<Self> {
         let entry = Entry::linked();
+
+        let layers = [Self::VALIDATION_NAME].map(CStr::as_ptr);
+
+        let extensions = {
+            let extensions = [
+                khr::Surface::name(),
+                ext::DebugUtils::name(),
+                #[cfg(target_os = "linux")]
+                {
+                    khr::XcbSurface::name()
+                },
+                #[cfg(target_os = "windows")]
+                {
+                    khr::Win32Surface::name()
+                },
+            ];
+
+            extensions.map(CStr::as_ptr)
+        };
 
         let application_info = vk::ApplicationInfo::builder()
             .application_version(0)
@@ -84,22 +131,54 @@ impl Instance {
             .engine_version(0)
             .api_version(vk::API_VERSION_1_3);
 
-        let enabled_layer_names = debug
-            .then(|| vec![VALIDATION_LAYER_NAME.as_ptr()])
-            .unwrap_or_default();
-
-        let enabled_extension_names = [
-            khr::Surface::name().as_ptr(),
-            khr::Win32Surface::name().as_ptr(),
-        ];
-
         let create_info = vk::InstanceCreateInfo::builder()
+            .flags(vk::InstanceCreateFlags::empty())
             .application_info(&application_info)
-            .enabled_layer_names(&enabled_layer_names)
-            .enabled_extension_names(&enabled_extension_names);
+            .enabled_layer_names(&layers)
+            .enabled_extension_names(&extensions);
 
+        // SAFETY: TODO
         let instance = unsafe { entry.create_instance(&create_info, None)? };
-        let physical_devices = Self::find_physical_devices(&instance)?;
+
+        let physical_devices = {
+            let mut physical_devices = Vec::default();
+
+            // SAFETY: TODO
+            for physical_device in unsafe { instance.enumerate_physical_devices() }? {
+                // SAFETY: TODO
+                let (properties, memory_properties, features, layers, extensions) = unsafe {
+                    (
+                        instance.get_physical_device_properties(physical_device),
+                        instance.get_physical_device_memory_properties(physical_device),
+                        instance.get_physical_device_features(physical_device),
+                        instance.enumerate_device_layer_properties(physical_device)?,
+                        instance.enumerate_device_extension_properties(physical_device)?,
+                    )
+                };
+
+                physical_devices.push(physical_device);
+                // TODO: Check Raytracing
+            }
+
+            physical_devices
+        };
+
+        unsafe {
+            use ext::DebugUtils;
+            use vk::{DebugUtilsMessengerCreateInfoEXT, DebugUtilsMessageSeverityFlagsEXT, DebugUtilsMessengerCreateFlagsEXT, DebugUtilsMessageTypeFlagsEXT};
+
+            DebugUtils::new(&entry, &instance).create_debug_utils_messenger(
+                &DebugUtilsMessengerCreateInfoEXT {
+                    flags: DebugUtilsMessengerCreateFlagsEXT::empty(),
+                    message_severity: DebugUtilsMessageSeverityFlagsEXT::VERBOSE | DebugUtilsMessageSeverityFlagsEXT::INFO | DebugUtilsMessageSeverityFlagsEXT::WARNING | DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                    message_type: DebugUtilsMessageTypeFlagsEXT::VALIDATION | DebugUtilsMessageTypeFlagsEXT::GENERAL | DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                    pfn_user_callback: Some(InstanceShared::debug_callback),
+                    ..Default::default()
+                },
+                None
+            );
+        }
+        // TODO: Sort Physical Devices
 
         Ok(Self(Arc::new(InstanceShared {
             entry,
@@ -108,35 +187,69 @@ impl Instance {
         })))
     }
 
-    pub fn new_surface(&self, window: &Window) -> Result<Surface> {
-        use crate::os::windows::WindowExt;
+    pub fn iter_adapters(&self) -> impl Iterator<Item = Adapter> + '_ {
+        let InstanceShared { physical_devices, .. } = &*self.0;
 
-        let win32_extension = khr::Win32Surface::new(&self.0.entry, &self.0.instance);
-
-        let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
-            .flags(vk::Win32SurfaceCreateFlagsKHR::empty())
-            .hinstance(window.hinstance().0 as *const _)
-            .hwnd(window.hwnd().0 as *const _);
-
-        let surface = unsafe { win32_extension.create_win32_surface(&create_info, None)? };
-        let extension = khr::Surface::new(&self.0.entry, &self.0.instance);
-
-        Ok(Surface {
-            surface,
-            extension,
+        physical_devices.iter().map(|physical_device| Adapter {
+            physical_device: *physical_device,
             _instance: Arc::clone(&self.0),
         })
     }
 
-    pub fn enumerate_adapters(&self) -> impl Iterator<Item = Adapter> + '_ {
-        let physical_devices = &self.0.physical_devices;
+    pub fn new_surface(&self, window: &Window) -> Result<Surface> {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::os::linux::{Window, WindowExt};
 
-        let to_adapter = |(physical_device_index, _)| Adapter {
-            physical_device_index,
-            _instance: Arc::clone(&self.0),
-        };
+            let (surface, imp) = match window.imp() {
+                Window::Xcb(_) => {
+                    use ::xcb::Xid;
 
-        physical_devices.iter().enumerate().map(to_adapter)
+                    use crate::os::linux::xcb::WindowExt;
+
+                    let create_info = vk::XcbSurfaceCreateInfoKHR::builder()
+                        .connection(window.connection() as *const _ as *mut _) // Hopefully safe :o :o
+                        .window(window.xid().resource_id());
+
+                    let surface = unsafe { self.0.xcb_surface_extension().create_xcb_surface(&create_info, None)? };
+                    let imp = SurfaceImp::Xcb { connection: window.connection(), xid: *window.xid() };
+                    (surface, imp)
+                }
+                Window::Wayland(_) => unimplemented!(),
+            };
+
+            Ok(Surface {
+                surface,
+                imp,
+                _instance: Arc::clone(&self.0),
+            })
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use crate::os::windows::WindowExt;
+
+            let win32_extension = khr::Win32Surface::new(&self.0.entry, &self.0.instance);
+
+            let create_info = vk::Win32SurfaceCreateInfoKHR::builder()
+                .flags(vk::Win32SurfaceCreateFlagsKHR::empty())
+                .hinstance(window.hinstance().0 as *const _)
+                .hwnd(window.hwnd().0 as *const _);
+
+            let surface = unsafe { win32_extension.create_win32_surface(&create_info, None)? };
+            let extension = khr::Surface::new(&self.0.entry, &self.0.instance);
+
+            Ok(Surface {
+                surface,
+                extension,
+                _instance: Arc::clone(&self.0),
+            })
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            unreachable!()
+        }
     }
 
     /// Creates a new device
@@ -147,65 +260,46 @@ impl Instance {
     /// creating a device.
     ///
     /// # Panics
-    ///
-    /// Panics if `props.adapter` doesn't support `props.surface`.
-    // TODO: Rewrite
-    // TODO: Implementations are valid if they support the extensions before they
-    // got included into the 1.1, 1.2 or 1.3 spec.
-    pub fn new_device(
-        &self,
-        surface: Option<&Surface>,
-        adapter: Option<Adapter>,
-        props: DeviceProps,
-    ) -> Result<Device> {
-        let InstanceShared { instance, .. } = &*self.0;
-        let physical_devices = &self.0.physical_devices;
-
-        let surface = surface.unwrap();
-        let adapter = adapter.unwrap();
-
-        assert!(adapter.is_surface_supported(surface)?);
-
-        let physical_device_index = adapter.physical_device_index;
-        let physical_device = physical_devices[physical_device_index];
-
-        let queue_families =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-
-        let queue_family_indices = Adapter::find_queue_family_indices(&queue_families);
-        let queue_create_infos =
-            Self::setup_queue_create_infos(&queue_families, &queue_family_indices)?;
-
-        let enabled_layer_names =
-            Vec::from(Adapter::REQUIRED_LAYER_NAMES.map(|name| name.as_ptr()));
-
-        let enabled_extension_names = {
-            let mut names = Vec::from(Adapter::REQUIRED_EXTENSION_NAMES.map(|name| name.as_ptr()));
-            names.push(khr::Swapchain::name().as_ptr());
-            names
+    pub fn new_device(&self, props: VulkanDeviceProps) -> Result<Device> {
+        let adapter = if let Some(adapter) = props.adapter {
+            adapter
+        } else {
+            // TODO: Intelligently Select a GPU.
+            if let Some(surface) = props.surface {
+                // TODO: Select a GPU that supports the surface.
+                todo!()
+            } else {
+                Adapter {
+                    physical_device: self.0.physical_devices[0],
+                    _instance: Arc::clone(&self.0),
+                }
+            }
         };
 
-        let mut features = vk::PhysicalDeviceFeatures2::builder();
-        unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+        let physical_device = *adapter.raw();
 
-        let mut timeline_features =
-            vk::PhysicalDeviceTimelineSemaphoreFeatures::builder().timeline_semaphore(true);
-
-        let mut features = features.push_next(&mut timeline_features);
+        QueueFamilyAllocator::pick_queue_families(PickQueueFamilyArgs {
+            instance: &self.0,
+            physical_device,
+            queue_families: &unsafe { self.raw().get_physical_device_queue_family_properties(physical_device) },
+            requirements: QueueFamilyRequirements {
+                surface: props.surface,
+                graphics_queues: props.graphics_queues,
+                compute_queues: props.compute_queues,
+                transfer_queues: props.transfer_queues }
+        });
 
         let create_info = vk::DeviceCreateInfo::builder()
-            .push_next(&mut features)
-            .queue_create_infos(&queue_create_infos)
-            .enabled_layer_names(&enabled_layer_names)
-            .enabled_extension_names(&enabled_extension_names);
+            .flags(vk::DeviceCreateFlags::empty())
+            .queue_create_infos(&[])
+            .enabled_extension_names(&[]);
 
-        let device = unsafe { instance.create_device(physical_device, &create_info, None)? };
+        let device = unsafe { self.raw().create_device(*adapter.raw(), &create_info, None)? };
 
         Ok(Device(Arc::new(DeviceShared {
             device,
-            physical_device_index,
             physical_device,
-            queue_family_indices,
+            queue_families: QueueFamilyAllocator {},
             _instance: Arc::clone(&self.0),
         })))
     }
@@ -290,137 +384,55 @@ impl Instance {
         })))
     }
 
-    fn find_required_layers(
-        props: &[vk::LayerProperties],
-    ) -> Option<impl Iterator<Item = &vk::LayerProperties>> {
-        let found_layers = props.iter().filter(|props| {
-            let layer_name = unsafe { CStr::from_ptr(props.layer_name.as_ptr()) };
-            Adapter::REQUIRED_LAYER_NAMES.contains(&layer_name)
-        });
+    // fn setup_queue_create_infos(
+    //     queue_families: &[vk::QueueFamilyProperties],
+    //     queue_family_indices: &QueueFamilyIndices,
+    // ) -> Result<Vec<vk::DeviceQueueCreateInfo>> { use vk::DeviceQueueCreateInfo;
 
-        let found_layer_names = found_layers
-            .clone()
-            .map(|props| unsafe { CStr::from_ptr(props.layer_name.as_ptr()) });
+    //     const PRIORITIES: [f32; 32] = [1.0; 32];
 
-        let has_required_layers = Adapter::REQUIRED_LAYER_NAMES
-            .iter()
-            .all(|&required| found_layer_names.clone().any(|found| found == required));
+    //     let QueueFamilyIndices { graphics, compute, transfer } =
+    //         Adapter::find_queue_family_indices(queue_families);
 
-        has_required_layers.then_some(found_layers)
-    }
+    //     let mut create_infos = Vec::with_capacity(3);
+    //     for i in [graphics, compute, transfer].into_iter().flatten() {
+    //         let create_info = DeviceQueueCreateInfo::builder()
+    //             .queue_family_index(i as _)
+    //             .queue_priorities(&PRIORITIES[0..1])
+    //             .build();
 
-    fn find_required_extensions(
-        props: &[vk::ExtensionProperties],
-    ) -> Option<impl Iterator<Item = &vk::ExtensionProperties>> {
-        let found_extensions = props.iter().filter(|props| {
-            let extension_name = unsafe { CStr::from_ptr(props.extension_name.as_ptr()) };
-            Adapter::REQUIRED_EXTENSION_NAMES.contains(&extension_name)
-        });
+    //         create_infos.push(create_info);
+    //     }
 
-        let found_extension_names = found_extensions
-            .clone()
-            .map(|props| unsafe { CStr::from_ptr(props.extension_name.as_ptr()) });
+    //     Ok(create_infos)
+    // }
+}
 
-        let has_required_extensions = Adapter::REQUIRED_EXTENSION_NAMES
-            .iter()
-            .all(|&required| found_extension_names.clone().any(|found| found == required));
-
-        has_required_extensions.then_some(found_extensions)
-    }
-
-    fn find_physical_devices(instance: &ash::Instance) -> Result<Vec<vk::PhysicalDevice>> {
-        let physical_device_groups = unsafe {
-            let mut buf =
-                vec![Default::default(); instance.enumerate_physical_device_groups_len()?];
-            instance.enumerate_physical_device_groups(buf.as_mut())?;
-
-            buf
-        };
-
-        unsafe { instance.enumerate_physical_devices() }.unwrap();
-
-        let physical_device_group = physical_device_groups[0];
-
-        let physical_devices = {
-            let len = physical_device_group.physical_device_count as _;
-            Vec::from(&physical_device_group.physical_devices[0..len])
-        };
-
-        // println!("{physical_devices:?}");
-
-        let is_supported = |physical_device: vk::PhysicalDevice| {
-            use vk::{api_version_major, api_version_minor, PhysicalDeviceProperties};
-
-            let properties = unsafe { instance.get_physical_device_properties(physical_device) };
-            let PhysicalDeviceProperties { api_version, .. } = properties;
-            if api_version_major(api_version) != 1 || api_version_minor(api_version) != 3 {
-                return Ok::<_, Error>(None);
-            }
-
-            let (layers, extensions) = unsafe {
-                let layers = instance.enumerate_device_layer_properties(physical_device);
-                let extensions = instance.enumerate_device_extension_properties(physical_device);
-                (layers?, extensions?)
-            };
-
-            let has_required_layers = Self::find_required_layers(&layers).is_some();
-            let has_required_extensions = Self::find_required_extensions(&extensions).is_some();
-
-            if !has_required_layers || !has_required_extensions {
-                return Ok(None);
-            }
-
-            Ok(Some(physical_device))
-        };
-
-        physical_devices
-            .iter()
-            .filter_map(|physical_device| is_supported(*physical_device).transpose())
-            .collect()
-    }
-
-    fn setup_queue_create_infos(
-        queue_families: &[vk::QueueFamilyProperties],
-        queue_family_indices: &QueueFamilyIndices,
-    ) -> Result<Vec<vk::DeviceQueueCreateInfo>> {
-        use vk::DeviceQueueCreateInfo;
-
-        const PRIORITIES: [f32; 32] = [1.0; 32];
-
-        let queue_family_indices = Adapter::find_queue_family_indices(&queue_families);
-        let graphics = queue_family_indices.graphics.unwrap_or_else(|| todo!());
-        let compute = queue_family_indices.compute.unwrap_or_else(|| todo!());
-        let transfer = queue_family_indices.transfer.unwrap_or_else(|| todo!());
-
-        let mut create_infos = Vec::with_capacity(3);
-        for i in [graphics, compute, transfer] {
-            let create_info = DeviceQueueCreateInfo::builder()
-                .queue_family_index(i as _)
-                .queue_priorities(&PRIORITIES[0..1])
-                .build();
-
-            create_infos.push(create_info);
-        }
-
-        Ok(create_infos)
+enum SurfaceImp {
+    Xcb {
+        connection: &'static xcb::Connection,
+        xid: xcb::x::Window
     }
 }
 
-impl_try_from_rhi_all!(Vulkan, Device);
+impl Debug for SurfaceImp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Xcb { connection, xid } => {
+                f.debug_struct("SurfaceImp::Xcb").field("xid", xid).finish_non_exhaustive()
+            }        
+        }
+    }
+}
 
+#[derive(Debug)]
 pub struct Surface {
     surface: vk::SurfaceKHR,
-    extension: khr::Surface,
+    imp: SurfaceImp,
     _instance: Arc<InstanceShared>,
 }
 
-impl std::fmt::Debug for Surface {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Surface")
-            .field("_instance", &self._instance)
-            .finish_non_exhaustive()
-    }
-}
+impl_try_from_rhi_all!(Vulkan, Surface);
 
 impl Surface {
     fn raw(&self) -> &vk::SurfaceKHR {
@@ -435,174 +447,100 @@ impl Drop for Surface {
     }
 }
 
-impl_try_from_rhi_all!(Vulkan, Surface);
-
 #[derive(Debug, Clone)]
 pub struct Adapter {
-    physical_device_index: usize,
+    physical_device: vk::PhysicalDevice,
     _instance: Arc<InstanceShared>,
 }
 
 impl_try_from_rhi_all!(Vulkan, Adapter);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct QueueFamilyIndices {
-    graphics: Option<usize>,
-    compute: Option<usize>,
-    transfer: Option<usize>,
+impl Adapter {
+    fn raw(&self) -> &vk::PhysicalDevice {
+        &self.physical_device
+    }
 }
 
 impl Adapter {
-    const REQUIRED_LAYER_NAMES: [&'static CStr; 0] = [];
+    pub fn id(&self) -> u32 {
+        use ::ash::vk::PhysicalDeviceProperties;
+        let Self { _instance, .. } = self;
 
-    #[cfg(target_os = "windows")]
-    const REQUIRED_EXTENSION_NAMES: [&'static CStr; 2] = [
-        khr::ExternalFenceWin32::name(),
-        khr::ExternalSemaphoreWin32::name(),
-    ];
+        // SAFETY: TODO
+        let properties = unsafe { _instance.raw().get_physical_device_properties(*self.raw()) };
+        let PhysicalDeviceProperties { device_id, .. } = properties;
 
-    #[cfg(target_os = "linux")]
-    const REQUIRED_EXTENSION_NAMES: [&'static CStr; 2] = [
-        khr::ExternalFenceFd::name(),
-        khr::ExternalSemaphoreFd::name(),
-    ];
+        device_id
+    }
 
-    /// Returns whether this adapter supports presenting to the passed surface
-    pub fn is_surface_supported(&self, surface: &Surface) -> Result<bool> {
-        let InstanceShared { instance, .. } = &*self._instance;
-        let physical_devices = &self._instance.physical_devices;
+    pub fn name(&self) -> String {
+        use ::ash::vk::PhysicalDeviceProperties;
+        let Self { _instance, .. } = self;
 
-        let physical_device = physical_devices[self.physical_device_index];
+        // SAFETY: TODO
+        let properties = unsafe { _instance.raw().get_physical_device_properties(*self.raw()) };
+        let PhysicalDeviceProperties { device_name, .. } = properties;
 
-        let queue_family_properties =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        // SAFETY: TODO
+        unsafe { String::from_utf8_unchecked(device_name.map(|b| b as _).to_vec()) }
+    }
 
-        for (i, _) in queue_family_properties.iter().enumerate() {
-            let presentable: bool = unsafe {
-                surface.extension.get_physical_device_surface_support(
-                    physical_device,
-                    i as _,
-                    *surface.raw(),
-                )?
-            };
+    pub fn kind(&self) -> AdapterKind {
+        use ::ash::vk::{PhysicalDeviceProperties, PhysicalDeviceType};
 
-            if presentable {
-                return Ok(true);
-            }
+        let Self { _instance, .. } = self;
+
+        // SAFETY: TODO
+        let properties = unsafe { _instance.raw().get_physical_device_properties(*self.raw()) };
+        let PhysicalDeviceProperties { device_type, .. } = properties;
+
+        // SAFETY: TODO
+        match device_type {
+            PhysicalDeviceType::DISCRETE_GPU => AdapterKind::Discrete,
+            PhysicalDeviceType::INTEGRATED_GPU | PhysicalDeviceType::CPU => AdapterKind::Integrated,
+            PhysicalDeviceType::VIRTUAL_GPU => AdapterKind::Virtual,
+            PhysicalDeviceType::OTHER => AdapterKind::Unknown,
+            // SAFETY: TODO
+            _ => unsafe { unreachable_unchecked() },
         }
-
-        Ok(false)
     }
+}
 
-    fn is_supported(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Result<bool> {
-        use vk::{api_version_major, api_version_minor, PhysicalDeviceProperties};
+type VulkanDeviceProps<'a> = DeviceProps<'a, Adapter, Surface>;
 
-        let properties = unsafe { instance.get_physical_device_properties(physical_device) };
-        let PhysicalDeviceProperties { api_version, .. } = properties;
-        if api_version_major(api_version) != 1 || api_version_minor(api_version) != 3 {
-            return Ok(false);
-        }
+impl<'a> TryFrom<DeviceProps<'a>> for VulkanDeviceProps<'a> {
+    type Error = BackendError;
+    fn try_from(value: DeviceProps<'a>) -> std::result::Result<Self, Self::Error> {
+        let DeviceProps {
+            adapter,
+            surface,
+            graphics_queues,
+            compute_queues,
+            transfer_queues,
+        } = value;
 
-        let (layer_props, extension_props) = unsafe {
-            let layer_props = instance.enumerate_device_layer_properties(physical_device)?;
-            let extension_props =
-                instance.enumerate_device_extension_properties(physical_device)?;
-            (layer_props, extension_props)
-        };
-
-        let has_required_layers = Self::has_required_layers(&layer_props);
-        let has_required_extensions = Self::has_required_extensions(&extension_props);
-        if !has_required_layers || !has_required_extensions {
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-
-    fn has_layer(name: &CStr, props: &[vk::LayerProperties]) -> bool {
-        props.iter().any(|vk::LayerProperties {layer_name, ..}| unsafe {CStr::from_ptr(layer_name.as_ptr())} == name)
-    }
-
-    fn has_extension(name: &CStr, props: &[vk::ExtensionProperties]) -> bool {
-        props
-            .iter()
-            .any(|vk::ExtensionProperties {extension_name, ..}| unsafe { CStr::from_ptr(extension_name.as_ptr()) } == name)
-    }
-
-    fn has_required_layers(props: &[vk::LayerProperties]) -> bool {
-        let mut layer_names = props
-            .iter()
-            .map(|props| unsafe { CStr::from_ptr(props.layer_name.as_ptr()) });
-
-        for required_layer_names in Self::REQUIRED_LAYER_NAMES {
-            if !layer_names.any(|layer_name| layer_name == required_layer_names) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    fn has_required_extensions(props: &[vk::ExtensionProperties]) -> bool {
-        let mut extension_names = props
-            .iter()
-            .map(|props| unsafe { CStr::from_ptr(props.extension_name.as_ptr()) });
-
-        for required_extension_names in Self::REQUIRED_EXTENSION_NAMES {
-            if !extension_names.any(|extension_names| extension_names == required_extension_names) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    fn has_required_features() -> bool {
-        true
-    }
-
-    // TODO: Find the family with the most amount of queues.
-    fn find_queue_family_indices(props: &[vk::QueueFamilyProperties]) -> QueueFamilyIndices {
-        use vk::{QueueFamilyProperties, QueueFlags};
-
-        let mut graphics = None;
-        let mut compute = None;
-        let mut transfer = None;
-        for (i, QueueFamilyProperties { queue_flags, .. }) in props.iter().enumerate() {
-            if queue_flags.contains(QueueFlags::GRAPHICS | QueueFlags::COMPUTE) {
-                graphics = Some(i);
-                continue;
-            }
-
-            if queue_flags.contains(QueueFlags::COMPUTE) {
-                compute = Some(i);
-                continue;
-            }
-
-            if queue_flags.contains(QueueFlags::TRANSFER) {
-                transfer = Some(i);
-                continue;
-            }
-        }
-
-        QueueFamilyIndices { graphics, compute, transfer }
+        Ok(VulkanDeviceProps {
+            adapter: adapter.map(TryInto::try_into).transpose()?,
+            surface: surface.map(TryInto::try_into).transpose()?,
+            graphics_queues,
+            compute_queues,
+            transfer_queues,
+        })
     }
 }
 
 struct DeviceShared {
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
-    physical_device_index: usize,
-    queue_family_indices: QueueFamilyIndices,
+    queue_families: QueueFamilyAllocator,
     _instance: Arc<InstanceShared>,
 }
 
 impl std::fmt::Debug for DeviceShared {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceShared")
             .field("physical_device", &self.physical_device)
-            .field("physical_device_index", &self.physical_device_index)
-            .field("queue_family_indies", &self.queue_family_indices)
+            .field("queue_families", &self.queue_families)
             .field("_instance", &self._instance)
             .finish_non_exhaustive()
     }
@@ -612,36 +550,63 @@ impl DeviceShared {
     fn raw(&self) -> &ash::Device {
         &self.device
     }
+
+    fn instance(&self) -> &ash::Instance {
+        &self._instance.raw()
+    }
 }
 
 impl Drop for DeviceShared {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.raw().device_wait_idle();
-            self.raw().destroy_device(None);
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
         }
     }
 }
 
 pub struct Device(Arc<DeviceShared>);
 
+impl_try_from_rhi_all!(Vulkan, Device);
+
+impl Device {
+    fn raw(&self) -> &ash::Device {
+        &self.0.raw()
+    }
+
+    fn instance(&self) -> &ash::Instance {
+        &self.0.instance()
+    }
+
+    fn new_pipeline_layout(&self) -> Result<vk::PipelineLayout> {
+        let layout_create_info = vk::PipelineLayoutCreateInfo::builder()
+            .set_layouts(&[])
+            .push_constant_ranges(&[])
+            .build();
+
+        unsafe { self.raw().create_pipeline_layout(&layout_create_info, None) }.map_err(Into::into)
+    }
+}
+
 impl Device {
     pub fn queue(&self, operations: Operations) -> Option<DQueue> {
-        let queue_family_indices = self.0.queue_family_indices;
-        let family_index = match operations {
-            Operations::Graphics => queue_family_indices.graphics.unwrap(),
-            Operations::Compute => queue_family_indices.compute.unwrap(),
-            Operations::Transfer => queue_family_indices.transfer.unwrap(),
-        };
+        // let queue_family_indices = self.0.queue_family_indices;
+        // let family_index = match operations {
+        //     Operations::Graphics => queue_family_indices.graphics.unwrap(),
+        //     Operations::Compute => queue_family_indices.compute.unwrap(),
+        //     Operations::Transfer => queue_family_indices.transfer.unwrap(),
+        // };
 
-        let queue = unsafe { self.0.raw().get_device_queue(family_index as _, 0) };
+        // let queue = unsafe { self.raw().get_device_queue(family_index as _, 0) };
 
-        Some(DQueue(Arc::new(DQueueShared {
-            queue,
-            family_index,
-            operations,
-            _device: Arc::clone(&self.0),
-        })))
+        // Some(DQueue(Arc::new(DQueueShared {
+        //     queue,
+        //     family_index,
+        //     operations,
+        //     _device: Arc::clone(&self.0),
+        // })))
+
+        todo!()
     }
 
     pub fn new_command_pool(&self, queue: &DQueue) -> Result<DCommandPool> {
@@ -685,7 +650,7 @@ impl Device {
 
         let create_info = SemaphoreCreateInfo::builder().push_next(&mut timeline_create_info);
 
-        let semaphore = unsafe { self.0.raw().create_semaphore(&create_info, None)? };
+        let semaphore = unsafe { self.raw().create_semaphore(&create_info, None)? };
 
         Ok(Semaphore {
             semaphore,
@@ -695,7 +660,7 @@ impl Device {
 
     pub fn new_binary_semaphore(&self) -> Result<BinarySemaphore> {
         let create_info = vk::SemaphoreCreateInfo::builder();
-        let semaphore = unsafe { self.0.raw().create_semaphore(&create_info, None)? };
+        let semaphore = unsafe { self.raw().create_semaphore(&create_info, None)? };
 
         Ok(BinarySemaphore {
             semaphore,
@@ -712,7 +677,7 @@ impl Device {
         }
 
         let create_info = FenceCreateInfo::builder().flags(flags);
-        let fence = unsafe { self.0.raw().create_fence(&create_info, None)? };
+        let fence = unsafe { self.raw().create_fence(&create_info, None)? };
 
         Ok(Fence {
             fence,
@@ -772,7 +737,7 @@ impl Device {
             .attachments(&attachments)
             .subpasses(&subpasses);
 
-        let render_pass = unsafe { self.0.raw().create_render_pass(&create_info, None)? };
+        let render_pass = unsafe { self.raw().create_render_pass(&create_info, None)? };
 
         Ok(RenderPass {
             render_pass,
@@ -780,12 +745,7 @@ impl Device {
         })
     }
 
-    pub fn new_framebuffer<'a, A>(
-        &self,
-        render_pass: &RenderPass,
-        attachments: A,
-        extent: UVec2,
-    ) -> Result<Framebuffer>
+    pub fn new_framebuffer<'a, A>(&self, render_pass: &RenderPass, attachments: A, extent: UVec2) -> Result<Framebuffer>
     where
         A: Iterator<Item = &'a DImageView2D>,
     {
@@ -804,7 +764,7 @@ impl Device {
             .attachments(&attachments)
             .layers(1);
 
-        let framebuffer = unsafe { self.0.raw().create_framebuffer(&create_info, None)? };
+        let framebuffer = unsafe { self.raw().create_framebuffer(&create_info, None)? };
 
         Ok(Framebuffer {
             framebuffer,
@@ -922,8 +882,8 @@ impl Device {
             .depth_bias_slope_factor(0.0)
             .line_width(1.0);
 
-        let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let multisample_state =
+            vk::PipelineMultisampleStateCreateInfo::builder().rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
         let attachments = [vk::PipelineColorBlendAttachmentState::builder()
             .blend_enable(false)
@@ -980,9 +940,7 @@ impl Device {
             descriptor_count: 1,
         }];
 
-        let create_info = vk::DescriptorPoolCreateInfo::builder()
-            .max_sets(16)
-            .pool_sizes(&sizes);
+        let create_info = vk::DescriptorPoolCreateInfo::builder().max_sets(16).pool_sizes(&sizes);
 
         let descriptor_pool = unsafe { self.raw().create_descriptor_pool(&create_info, None) }?;
         Ok(DescriptorPool {
@@ -992,10 +950,7 @@ impl Device {
     }
 
     pub fn new_buffer(&self, props: &DBufferProps) -> Result<DBuffer> {
-        use vk::{
-            BufferCreateInfo, BufferUsageFlags, MemoryAllocateInfo, MemoryPropertyFlags,
-            SharingMode,
-        };
+        use vk::{BufferCreateInfo, BufferUsageFlags, MemoryAllocateInfo, MemoryPropertyFlags, SharingMode};
 
         let usage = match props.usage {
             Usage::Uniform => BufferUsageFlags::UNIFORM_BUFFER,
@@ -1050,26 +1005,7 @@ impl Device {
     }
 
     pub fn wait_idle(&self) -> Result<()> {
-        unsafe { self.0.raw().device_wait_idle() }.map_err(Into::into)
-    }
-}
-
-impl Device {
-    fn raw(&self) -> &ash::Device {
-        &self.0.device
-    }
-
-    fn instance(&self) -> &ash::Instance {
-        &self.0._instance.raw()
-    }
-
-    fn new_pipeline_layout(&self) -> Result<vk::PipelineLayout> {
-        let layout_create_info = vk::PipelineLayoutCreateInfo::builder()
-            .set_layouts(&[])
-            .push_constant_ranges(&[])
-            .build();
-
-        unsafe { self.raw().create_pipeline_layout(&layout_create_info, None) }.map_err(Into::into)
+        unsafe { self.raw().device_wait_idle() }.map_err(Into::into)
     }
 }
 
@@ -1119,27 +1055,28 @@ impl DSwapchain {
     ) -> Result<Option<usize>> {
         let SwapchainShared { extension, .. } = &*self.0;
 
-        let device_mask = self.0._device.physical_device_index + 1;
+        // let device_mask = self.0._device.physical_device_index + 1;
 
-        let fence = if let Some(fence) = fence {
-            *fence.raw()
-        } else {
-            vk::Fence::null()
-        };
+        // let fence = if let Some(fence) = fence {
+        //     *fence.raw()
+        // } else {
+        //     vk::Fence::null()
+        // };
 
-        let acquire_next_image_info = vk::AcquireNextImageInfoKHR::builder()
-            .swapchain(*self.raw())
-            .timeout(timeout.as_nanos() as _)
-            .semaphore(*semaphore.raw())
-            .fence(fence)
-            .device_mask(device_mask as _);
+        // let acquire_next_image_info = vk::AcquireNextImageInfoKHR::builder()
+        //     .swapchain(*self.raw())
+        //     .timeout(timeout.as_nanos() as _)
+        //     .semaphore(*semaphore.raw())
+        //     .fence(fence)
+        //     .device_mask(device_mask as _);
 
-        let result = unsafe { extension.acquire_next_image2(&acquire_next_image_info) };
-        if matches!(result, Err(vk::Result::TIMEOUT)) {
-            return Ok(None);
-        }
+        // let result = unsafe { extension.acquire_next_image2(&acquire_next_image_info)
+        // }; if matches!(result, Err(vk::Result::TIMEOUT)) {
+        //     return Ok(None);
+        // }
 
-        Ok(Some(result?.0 as _))
+        // Ok(Some(result?.0 as _))
+        todo!()
     }
 
     pub unsafe fn image_unchecked(&self, i: usize) -> DImageView2D {
@@ -1175,10 +1112,11 @@ impl DSwapchain {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
-        let graphics_index = _device.queue_family_indices.graphics.unwrap();
-        let graphics_queue = unsafe { _device.raw().get_device_queue(graphics_index as _, 0) };
+        // let graphics_index = _device.queue_family_indices.graphics.unwrap();
+        // let graphics_queue = unsafe { _device.raw().get_device_queue(graphics_index
+        // as _, 0) };
 
-        let _ = unsafe { extension.queue_present(graphics_queue, &present_info) }?;
+        // let _ = unsafe { extension.queue_present(graphics_queue, &present_info) }?;
         Ok(())
     }
 
@@ -1226,11 +1164,7 @@ impl DQueue {
 
     fn extract_wait_semaphores(
         submit_infos: &[VulkanSubmitInfo],
-    ) -> (
-        Vec<Vec<vk::Semaphore>>,
-        Vec<Vec<vk::PipelineStageFlags>>,
-        Vec<Vec<u64>>,
-    ) {
+    ) -> (Vec<Vec<vk::Semaphore>>, Vec<Vec<vk::PipelineStageFlags>>, Vec<Vec<u64>>) {
         let mut semaphores = Vec::with_capacity(4);
         let mut stages = Vec::with_capacity(4);
         let mut values = Vec::with_capacity(4);
@@ -1260,9 +1194,7 @@ impl DQueue {
         (semaphores, stages, values)
     }
 
-    fn extract_signal_semaphores(
-        submit_infos: &[VulkanSubmitInfo],
-    ) -> (Vec<Vec<vk::Semaphore>>, Vec<Vec<u64>>) {
+    fn extract_signal_semaphores(submit_infos: &[VulkanSubmitInfo]) -> (Vec<Vec<vk::Semaphore>>, Vec<Vec<u64>>) {
         let mut semaphores = Vec::with_capacity(4);
         let mut values = Vec::with_capacity(4);
 
@@ -1288,13 +1220,8 @@ impl DQueue {
     }
 }
 
-pub type VulkanSubmitInfo<'a> = SubmitInfo<
-    'a,
-    vulkan::DCommandList,
-    vulkan::Semaphore,
-    vulkan::PipelineStage,
-    vulkan::BinarySemaphore,
->;
+pub type VulkanSubmitInfo<'a> =
+    SubmitInfo<'a, vulkan::DCommandList, vulkan::Semaphore, vulkan::PipelineStage, vulkan::BinarySemaphore>;
 
 impl DQueue {
     pub fn operations(&self) -> Operations {
@@ -1310,8 +1237,7 @@ impl DQueue {
         use vk::{PipelineStageFlags, SubmitInfo, TimelineSemaphoreSubmitInfo};
         let submit_infos_len = submit_infos.len();
 
-        let (wait_semaphores, wait_stages, wait_values) =
-            Self::extract_wait_semaphores(submit_infos);
+        let (wait_semaphores, wait_stages, wait_values) = Self::extract_wait_semaphores(submit_infos);
 
         let command_buffers = Self::extract_command_buffers(submit_infos);
         let (signal_semaphores, signal_values) = Self::extract_signal_semaphores(submit_infos);
@@ -1359,8 +1285,7 @@ impl DQueue {
     }
 }
 
-pub type VulkanSemaphoreSubmitInfo<'a> =
-    SemaphoreSubmitInfo<'a, vulkan::Semaphore, vulkan::BinarySemaphore>;
+pub type VulkanSemaphoreSubmitInfo<'a> = SemaphoreSubmitInfo<'a, vulkan::Semaphore, vulkan::BinarySemaphore>;
 
 impl<'a> TryFrom<SemaphoreSubmitInfo<'a>> for VulkanSemaphoreSubmitInfo<'a> {
     type Error = BackendError;
@@ -1508,8 +1433,7 @@ impl DCommandList {
             .flags(CommandBufferUsageFlags::empty())
             .inheritance_info(&inheritance_info);
 
-        self.device()
-            .begin_command_buffer(*self.raw(), &begin_info)?;
+        self.device().begin_command_buffer(*self.raw(), &begin_info)?;
 
         self.state = State::Recording;
         Ok(())
@@ -1520,11 +1444,7 @@ impl DCommandList {
     /// - The command list must be in the recording state.
     ///
     /// - The command list must not have begun a render pass without ending it.
-    pub unsafe fn begin_render_pass_unchecked(
-        &mut self,
-        render_pass: &RenderPass,
-        framebuffer: &mut Framebuffer,
-    ) {
+    pub unsafe fn begin_render_pass_unchecked(&mut self, render_pass: &RenderPass, framebuffer: &mut Framebuffer) {
         let device = self.device();
 
         let clear_value = [vk::ClearValue {
@@ -1547,20 +1467,12 @@ impl DCommandList {
         // });
         // .clear_values(&clear_value);
 
-        unsafe {
-            device.cmd_begin_render_pass(*self.raw(), &begin_info, vk::SubpassContents::INLINE)
-        };
+        unsafe { device.cmd_begin_render_pass(*self.raw(), &begin_info, vk::SubpassContents::INLINE) };
     }
 
     pub unsafe fn bind_pipeline_unchecked(&mut self, pipeline: &Pipeline) {
         let device = self.device();
-        unsafe {
-            device.cmd_bind_pipeline(
-                *self.raw(),
-                vk::PipelineBindPoint::GRAPHICS,
-                *pipeline.raw(),
-            )
-        };
+        unsafe { device.cmd_bind_pipeline(*self.raw(), vk::PipelineBindPoint::GRAPHICS, *pipeline.raw()) };
     }
 
     pub unsafe fn bind_vertex_buffers_unchecked<'a, I>(&mut self, buffers: I)
@@ -1651,13 +1563,7 @@ impl DCommandList {
         }
     }
 
-    pub unsafe fn copy_image_unchecked(
-        &mut self,
-        command_pool: &mut DCommandPool,
-        src: &DImage2D,
-        dst: &DImage2D,
-    ) {
-    }
+    pub unsafe fn copy_image_unchecked(&mut self, command_pool: &mut DCommandPool, src: &DImage2D, dst: &DImage2D) {}
 
     fn raw(&self) -> &vk::CommandBuffer {
         &self.buffer
@@ -1691,9 +1597,7 @@ impl Semaphore {
         let semaphores = [*self.raw()];
         let values = [value];
 
-        let wait_info = vk::SemaphoreWaitInfo::builder()
-            .semaphores(&semaphores)
-            .values(&values);
+        let wait_info = vk::SemaphoreWaitInfo::builder().semaphores(&semaphores).values(&values);
 
         match unsafe { device.wait_semaphores(&wait_info, timeout.as_nanos() as _) } {
             Ok(_) => Ok(true),
@@ -1705,9 +1609,7 @@ impl Semaphore {
     pub fn signal(&mut self, value: u64) -> Result<()> {
         let device = self._device.raw();
 
-        let signal_info = vk::SemaphoreSignalInfo::builder()
-            .semaphore(*self.raw())
-            .value(value);
+        let signal_info = vk::SemaphoreSignalInfo::builder().semaphore(*self.raw()).value(value);
 
         unsafe { device.signal_semaphore(&signal_info) }.map_err(Into::into)
     }
@@ -2028,10 +1930,7 @@ impl DBuffer {
         let size: vk::DeviceSize = self.size.get() as _;
         let data = unsafe { self._device.raw().map_memory(memory, 0, size, FLAGS)? };
 
-        Ok(std::slice::from_raw_parts_mut(
-            data as *mut _,
-            self.size.get(),
-        ))
+        Ok(std::slice::from_raw_parts_mut(data as *mut _, self.size.get()))
     }
 
     pub unsafe fn unmap_unchecked(&self) {
@@ -2126,5 +2025,125 @@ impl From<Format> for vk::Format {
         //     Format::R32G32B32A32Sint => Self::R32G32B32A32_SINT,
         //     Format::R32G32B32A32Float => Self::R32G32B32A32_SFLOAT,
         // }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueueFamilyRequirements<'a> {
+    surface: Option<&'a Surface>,
+    graphics_queues: Option<Range<usize>>,
+    compute_queues: (Option<Range<usize>>, bool),
+    transfer_queues: (Option<Range<usize>>, bool),
+}
+
+#[derive(Debug, Default)]
+struct QueueFamily {
+    index: usize,
+    count: usize,
+}
+
+#[derive(Debug, Default)]
+struct QueueFamilySet {
+    /// Present usually is the graphics queue or one of the other two queues,
+    /// but it is not guaranteed. If there is no surface passed into the
+    /// requirements present will simply be empty and an assertion will be
+    /// thrown when trying to create the swapchain.
+    /// The last field in the option, indicates whether the queue family is
+    /// dedicated. If no present queue was found, then the option will
+    /// contain None. If no surface has been supplied, present will contain
+    /// None.
+    present: Option<(QueueFamily, bool)>,
+    /// Dedicated Graphics + Compute + Transfer
+    graphics: Option<QueueFamily>,
+    /// Dedicated Compute + Transfer
+    /// The last field in the option, indicates whether the queue family is
+    /// dedicated.
+    compute: Option<(QueueFamily, bool)>,
+    /// The last field in the option, indicates whether the queue family is
+    /// dedicated. The option will contain None, if the requirements
+    /// indicate a dedicated transfer queue is required, but none was found.
+    /// Queue Families can share queues, meaning if the physical device contains
+    /// 5 graphics queues and only 2 are required for graphics ops. then the
+    /// rest of them can go to the transfer queue. Resource Sharing barries
+    /// are automatically no-opped if it can be determined automatically that
+    /// the resources belong to the same queue.
+    transfer: Option<(QueueFamily, bool)>,
+}
+
+struct PickQueueFamilyArgs<'a> {
+    instance: &'a Arc<InstanceShared>,
+    physical_device: vk::PhysicalDevice,
+    queue_families: &'a [vk::QueueFamilyProperties],
+    requirements: QueueFamilyRequirements<'a>
+}
+
+#[derive(Debug)]
+struct QueueFamilyAllocator {}
+
+impl QueueFamilyAllocator {
+    pub fn new(physical_device: vk::PhysicalDevice) -> Self {
+        todo!()
+    }
+
+    /// Picks the best queue families from the ones supplied in `families`
+    ///
+    /// The algorithm first looks for dedicated queue families for the graphics,
+    /// compute and transfer and attempts to use the graphics queue as a present
+    /// queue. Afterwards depending on dedicated compute and transfer are
+    /// required, either fills out these with remaining available queues from
+    /// the graphics queue or compute queue.
+    /// If no range is specified, maximum 4 queues are enabled for the given
+    /// family.
+    pub fn pick_queue_families(args: PickQueueFamilyArgs) -> Option<QueueFamilySet> {
+        use vk::{QueueFamilyProperties, QueueFlags};
+        let PickQueueFamilyArgs {instance, physical_device, queue_families, requirements} = args;
+
+        let mut set = QueueFamilySet::default();
+        for (i, QueueFamilyProperties { queue_flags, queue_count, .. }) in queue_families.iter().enumerate() {
+            if let Some(surface) = &requirements.surface {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    match surface.imp {
+                        SurfaceImp::Xcb { mut connection, xid } => {
+                            use ::xcb::{Xid};
+
+                            instance.xcb_surface_extension().get_physical_device_xcb_presentation_support(
+                                physical_device,
+                                i as _,
+                                std::mem::transmute(&mut connection),
+                                xid.resource_id()
+                            );
+                        }
+                    }
+                }
+
+            let Range { start, end } = requirements.graphics_queues.clone().unwrap_or(1..5);
+            if queue_flags.contains(QueueFlags::GRAPHICS | QueueFlags::COMPUTE) {
+                    unsafe {
+                        instance.surface_extension().get_physical_device_surface_support(physical_device, i as _, *surface.raw()).unwrap()
+                    };
+                }
+
+                if set.graphics.is_none() && start >= *queue_count as _ {
+                    set.graphics = Some(QueueFamily {
+                        index: i,
+                        count: (*queue_count as usize).min(end - 1),
+                    });
+
+                    continue;
+                } else if let Some(graphics) = set.graphics.as_mut() && start >= *queue_count as _ {
+                    if graphics.count < *queue_count as _ {
+                        *graphics = QueueFamily {
+                            index: i,
+                            count: (*queue_count as usize).min(end - 1)
+                        } 
+                    }
+
+                    continue;
+                }
+            }
+        }
+
+        None
     }
 }

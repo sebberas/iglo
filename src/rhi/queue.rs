@@ -29,7 +29,7 @@ impl DQueue {
     /// This function panics if any of the command lists belong to another
     /// queue.
     // TODO Measure overhead of type conversions. Maybe use iterators with generics
-    // instead.
+    // instead???
     pub unsafe fn submit_unchecked<'a>(
         &mut self,
         submit_infos: impl IntoIterator<Item = SubmitInfo<'a>>,
@@ -138,9 +138,7 @@ pub struct CommandPool<O: OperationsType = ops::Graphics>(DCommandPool, PhantomD
 impl<O: OperationsType> CommandPool<O> {
     pub fn new(command_pool: DCommandPool) -> Option<Self> {
         match command_pool.operations() {
-            operations if operations == O::OPERATIONS => {
-                Some(unsafe { CommandPool::new_unchecked(command_pool) })
-            }
+            operations if operations == O::OPERATIONS => Some(unsafe { CommandPool::new_unchecked(command_pool) }),
             _ => None,
         }
     }
@@ -243,11 +241,7 @@ impl DCommandList {
     /// - No other render passes are currently recording meaning you can't call
     ///   `begin_render_pass_unchecked` two times in a row without calling
     ///   `end_render_pass_unchecked` in between.
-    pub unsafe fn begin_render_pass_unchecked(
-        &mut self,
-        render_pass: &RenderPass,
-        framebuffer: &mut Framebuffer,
-    ) {
+    pub unsafe fn begin_render_pass_unchecked(&mut self, render_pass: &RenderPass, framebuffer: &mut Framebuffer) {
         match self {
             Self::Vulkan(command_list) => {
                 let render_pass = render_pass.try_into().unwrap();
@@ -356,12 +350,7 @@ impl DCommandList {
     }
 
     /// Copy one image to another
-    pub unsafe fn copy_image_unchecked(
-        &mut self,
-        command_pool: &mut DCommandPool,
-        src: &DImage2D,
-        dst: &DImage2D,
-    ) {
+    pub unsafe fn copy_image_unchecked(&mut self, command_pool: &mut DCommandPool, src: &DImage2D, dst: &DImage2D) {
         match self {
             Self::Vulkan(command_list) => {
                 let command_pool = command_pool.try_into().unwrap();
@@ -378,9 +367,7 @@ pub struct CommandList<O: OperationsType = ops::Graphics>(DCommandList, PhantomD
 impl<O: OperationsType> CommandList<O> {
     pub fn new(command_list: DCommandList) -> Option<Self> {
         match command_list.operations() {
-            operations if operations == O::OPERATIONS => {
-                Some(unsafe { CommandList::new_unchecked(command_list) })
-            }
+            operations if operations == O::OPERATIONS => Some(unsafe { CommandList::new_unchecked(command_list) }),
             _ => None,
         }
     }

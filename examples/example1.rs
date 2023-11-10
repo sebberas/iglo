@@ -10,6 +10,8 @@ use iglo::os::*;
 use iglo::rhi::vulkan::ShaderStage;
 use iglo::rhi::*;
 
+const EXTENT: UVec2 = uvec2(1366, 768);
+
 fn main() {
     let pool = ThreadPool::new().unwrap();
     let future = async {
@@ -19,7 +21,7 @@ fn main() {
         window.show();
         while !window.should_close() {
             let _ = window.poll_events();
-            renderer.update(window.inner_extent());
+            renderer.update(EXTENT);
         }
     };
 
@@ -80,11 +82,7 @@ impl Renderer {
 
         let mut framebuffers = Vec::with_capacity(3);
         for i in 0..3 {
-            let framebuffer = device.new_framebuffer(
-                &render_pass,
-                &[unsafe { swapchain.image_unchecked(i) }],
-                window.inner_extent(),
-            );
+            let framebuffer = device.new_framebuffer(&render_pass, &[unsafe { swapchain.image_unchecked(i) }], EXTENT);
 
             framebuffers.push(framebuffer.unwrap())
         }
@@ -147,17 +145,10 @@ impl Renderer {
 
         let dcommand_list = self.command_lists[self.frame].as_mut();
         unsafe {
-            dcommand_list
-                .reset_unchecked(self.command_pool.as_mut())
-                .unwrap();
-            dcommand_list
-                .begin_unchecked(self.command_pool.as_mut())
-                .unwrap();
+            dcommand_list.reset_unchecked(self.command_pool.as_mut()).unwrap();
+            dcommand_list.begin_unchecked(self.command_pool.as_mut()).unwrap();
 
-            dcommand_list.begin_render_pass_unchecked(
-                &self.render_pass,
-                &mut self.framebuffers[image_view_i],
-            );
+            dcommand_list.begin_render_pass_unchecked(&self.render_pass, &mut self.framebuffers[image_view_i]);
 
             dcommand_list.bind_pipeline_unchecked(&self.pipeline);
 
@@ -186,15 +177,9 @@ impl Renderer {
         };
 
         let dqueue = self.queue.as_mut();
-        unsafe {
-            dqueue
-                .submit_unchecked([submit_info], Some(in_flight))
-                .unwrap()
-        };
+        unsafe { dqueue.submit_unchecked([submit_info], Some(in_flight)).unwrap() };
 
-        self.swapchain
-            .present(&image_view, [render_finished])
-            .unwrap();
+        self.swapchain.present(&image_view, [render_finished]).unwrap();
 
         self.frame = (self.frame + 1) % Self::MAX_FRAMES_IN_FLIGHT;
     }
@@ -203,7 +188,7 @@ impl Renderer {
 impl Renderer {
     fn setup_device_and_swapchain(window: &Window) -> (Device, DSwapchain) {
         let instance = Instance::new(Backend::Vulkan, true).unwrap();
-        let adapter = instance.enumerate_adapters().next().unwrap();
+        let adapter = instance.iter_adapters().next().unwrap();
 
         let surface = instance.new_surface(window).unwrap();
 
@@ -211,8 +196,8 @@ impl Renderer {
             adapter: Some(adapter),
             surface: Some(&surface),
             graphics_queues: None,
-            compute_queues: None,
-            transfer_queues: None,
+            compute_queues: todo!(),
+            transfer_queues: todo!(),
         };
 
         let device = instance.new_device(device_props).unwrap();
@@ -222,7 +207,7 @@ impl Renderer {
             surface,
             images: NonZeroUsize::new(3).unwrap(),
             image_format: Format::R8G8B8A8Unorm,
-            image_extent: window.inner_extent(),
+            image_extent: EXTENT,
             present_mode: PresentMode::Immediate,
         };
 
@@ -271,10 +256,7 @@ impl Renderer {
         let vertex_shader = device.new_shader(Self::VERTEX_SHADER_CODE).unwrap();
         let pixel_shader = device.new_shader(Self::PIXEL_SHADER_CODE).unwrap();
 
-        let shaders = [
-            (vertex_shader, ShaderStage::Vertex),
-            (pixel_shader, ShaderStage::Pixel),
-        ];
+        let shaders = [(vertex_shader, ShaderStage::Vertex), (pixel_shader, ShaderStage::Pixel)];
 
         let state = PipelineState {
             vertex_input: Some(VertexInputState {
@@ -341,9 +323,7 @@ impl Renderer {
 
         let dcommand_list = command_list.as_mut();
         unsafe {
-            dcommand_list
-                .begin_unchecked(command_pool.as_mut())
-                .unwrap();
+            dcommand_list.begin_unchecked(command_pool.as_mut()).unwrap();
 
             dcommand_list.copy_buffer_unchecked(
                 command_pool.as_mut(),

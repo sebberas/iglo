@@ -2,6 +2,10 @@ use std::num::*;
 
 use crate::rhi::*;
 
+pub enum Surface {
+    Vulkan(vulkan::Surface),
+}
+
 pub enum PresentMode {
     Immediate,
     Mailbox,
@@ -91,14 +95,9 @@ impl DSwapchain {
     //     &mut self,
     //     fence: &mut Fence,
     //     timeout: Duration,
-    // ) -> Result<Option<DImageView2D>, Error> {
-    //     match self {
-    //         Self::Vulkan(swapchain) => {
-    //             let fence = fence.try_into().unwrap();
-    //             let image = swapchain.image_unchecked(fence, timeout);
-    //             image.map(|image| image.map(Into::into))
-    //         }
-    //     }
+    // ) -> Result<Option<DImageView2D>, Error> { match self { Self::Vulkan(swapchain) => { let
+    //   fence = fence.try_into().unwrap(); let image = swapchain.image_unchecked(fence, timeout);
+    //   image.map(|image| image.map(Into::into)) } }
     // }
 
     /// Enumerates all the images in the swapchain.
